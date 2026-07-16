@@ -1,14 +1,17 @@
 import { MODULE_ID } from './constants.js';
 import { FoundryDataAccess } from './data-access.js';
 import { ComfyUIManager } from './comfyui-manager.js';
+import { CombatTurnWatcher } from './combat-turn-watcher.js';
 
 export class QueryHandlers {
   public dataAccess: FoundryDataAccess;
   private comfyuiManager: ComfyUIManager;
+  private combatWatcher: CombatTurnWatcher;
 
   constructor() {
     this.dataAccess = new FoundryDataAccess();
     this.comfyuiManager = new ComfyUIManager();
+    this.combatWatcher = new CombatTurnWatcher();
   }
 
   /**
@@ -157,6 +160,10 @@ export class QueryHandlers {
     CONFIG.queries[`${modulePrefix}.addSpellsToActor`] = this.handleAddSpellsToActor.bind(this);
     CONFIG.queries[`${modulePrefix}.addFeaturesFromCompendium`] =
       this.handleAddFeaturesFromCompendium.bind(this);
+
+    // Combat turn wait (T25) — install the hook and register the blocking query.
+    this.combatWatcher.register();
+    CONFIG.queries[`${modulePrefix}.waitForTurn`] = this.handleWaitForTurn.bind(this);
   }
 
   /**
@@ -169,6 +176,9 @@ export class QueryHandlers {
     for (const key of keysToRemove) {
       delete CONFIG.queries[key];
     }
+
+    // Release any pending wait_for_turn waiters and mark hooks unregistered (T25).
+    this.combatWatcher.unregister();
   }
 
   /**
@@ -394,6 +404,22 @@ export class QueryHandlers {
       worldId: game.world?.id,
       userId: game.user?.id,
     };
+  }
+
+  /**
+   * Block until it is an NPC-owned turn, combat ends, or the short Foundry-side
+   * ceiling elapses, then return { status, round, current_combatant }. Read/wait
+   * only — no state change. Contract: /bridge/wait-for-turn-SPEC.md.
+   */
+  private async handleWaitForTurn(data?: { block_seconds?: number }): Promise<any> {
+    // SECURITY: silent GM validation (bridge connects as GM). Non-GM callers get
+    // a benign no-op rather than combat state.
+    const access = this.validateGMAccess();
+    if (!access.allowed) {
+      return { status: 'combat_ended', round: null, current_combatant: null };
+    }
+
+    return await this.combatWatcher.waitForTurn(data);
   }
 
   /**
