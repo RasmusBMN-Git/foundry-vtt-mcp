@@ -29,6 +29,8 @@ import { QuestCreationTools } from './tools/quest-creation.js';
 
 import { DiceRollTools } from './tools/dice-roll.js';
 
+import { CombatTools } from './tools/combat.js';
+
 import { CampaignManagementTools } from './tools/campaign-management.js';
 
 import { OwnershipTools } from './tools/ownership.js';
@@ -1207,6 +1209,8 @@ async function startBackend(): Promise<void> {
 
   const diceRollTools = new DiceRollTools({ foundryClient, logger });
 
+  const combatTools = new CombatTools({ foundryClient, logger });
+
   const campaignManagementTools = new CampaignManagementTools(foundryClient, logger);
 
   const ownershipTools = new OwnershipTools({ foundryClient, logger });
@@ -1431,6 +1435,8 @@ async function startBackend(): Promise<void> {
     ...questCreationTools.getToolDefinitions(),
 
     ...diceRollTools.getToolDefinitions(),
+
+    ...combatTools.getToolDefinitions(),
 
     ...campaignManagementTools.getToolDefinitions(),
 
@@ -1664,6 +1670,13 @@ async function startBackend(): Promise<void> {
 
                 case 'request-player-rolls':
                   result = await diceRollTools.handleRequestPlayerRolls(args);
+
+                  break;
+
+                // Combat turn-handoff tool (wait_for_turn) — T26
+
+                case 'wait-for-turn':
+                  result = await combatTools.handleWaitForTurn(args);
 
                   break;
 
