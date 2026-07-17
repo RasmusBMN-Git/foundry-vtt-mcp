@@ -1736,6 +1736,16 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'enroll-tokens-in-combat':
+                  result = await tokenManipulationTools.handleEnrollTokensInCombat(args);
+
+                  break;
+
+                case 'roll-npc-initiative':
+                  result = await tokenManipulationTools.handleRollNpcInitiative(args);
+
+                  break;
+
                 // Map generation tools
 
                 case 'generate-map':

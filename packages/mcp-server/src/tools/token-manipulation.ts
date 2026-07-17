@@ -178,6 +178,38 @@ export class TokenManipulationTools {
           properties: {},
         },
       },
+      {
+        name: 'enroll-tokens-in-combat',
+        description:
+          'Enroll one or more NPC/monster tokens into the active combat (creating a combat on the current scene if none exists). NPC-side only: a player-owned (PC) token is rejected — the player enrolls the PC themselves. Returns the combat id and the enrolled { tokenId, combatantId } pairs. Roll their initiative afterwards with roll-npc-initiative.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tokenIds: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'The scene token IDs of the NPC tokens to add to combat.',
+            },
+          },
+          required: ['tokenIds'],
+        },
+      },
+      {
+        name: 'roll-npc-initiative',
+        description:
+          "Roll initiative for NPC combatants in the active combat. With combatantIds, rolls for exactly those; without, rolls for every NPC that has no initiative yet (native rollNPC). Returns the current initiative order. NPC-side only — the player rolls the PC's initiative in Foundry.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            combatantIds: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Optional: specific combatant IDs to roll. Omit to roll all NPCs missing initiative.',
+            },
+          },
+        },
+      },
     ];
   }
 
@@ -425,6 +457,59 @@ export class TokenManipulationTools {
       this.logger.error('Failed to get available conditions', error);
       throw new Error(
         `Failed to get available conditions: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  // T-SETUP: enroll NPC tokens into combat. The Foundry side gates each token
+  // (rejects a PC token / invalid target); this handler passes the result
+  // through, surfacing a gate error as an error rather than a silent success.
+  async handleEnrollTokensInCombat(args: any): Promise<any> {
+    const schema = z.object({ tokenIds: z.array(z.string()).min(1) });
+    const { tokenIds } = schema.parse(args);
+
+    this.logger.info('Enrolling tokens in combat', { tokenIds });
+
+    try {
+      const result = await this.foundryClient.query('foundry-mcp-bridge.enrollTokensInCombat', {
+        tokenIds,
+      });
+
+      if (result && (result as any).success === false) {
+        this.logger.warn('Enroll rejected by gate', result);
+        throw new Error(
+          `Cannot enroll token ${(result as any).tokenId ?? ''}: ${(result as any).error}`
+        );
+      }
+
+      this.logger.debug('Tokens enrolled', { tokenIds });
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to enroll tokens in combat', error);
+      throw new Error(
+        `Failed to enroll tokens in combat: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  // T-SETUP: roll NPC initiative in the active combat.
+  async handleRollNpcInitiative(args: any): Promise<any> {
+    const schema = z.object({ combatantIds: z.array(z.string()).optional() });
+    const { combatantIds } = schema.parse(args ?? {});
+
+    this.logger.info('Rolling NPC initiative', { combatantIds });
+
+    try {
+      const result = await this.foundryClient.query(
+        'foundry-mcp-bridge.rollNpcInitiative',
+        combatantIds ? { combatantIds } : {}
+      );
+      this.logger.debug('NPC initiative rolled');
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to roll NPC initiative', error);
+      throw new Error(
+        `Failed to roll NPC initiative: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

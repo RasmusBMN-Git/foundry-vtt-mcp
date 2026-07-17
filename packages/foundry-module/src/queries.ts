@@ -2,6 +2,7 @@ import { MODULE_ID } from './constants.js';
 import { FoundryDataAccess } from './data-access.js';
 import { ComfyUIManager } from './comfyui-manager.js';
 import { CombatTurnWatcher } from './combat-turn-watcher.js';
+import { checkTarget, makeLiveTokenResolver } from './target-check.js';
 
 export class QueryHandlers {
   public dataAccess: FoundryDataAccess;
@@ -103,6 +104,11 @@ export class QueryHandlers {
       this.handleToggleTokenCondition.bind(this);
     CONFIG.queries[`${modulePrefix}.getAvailableConditions`] =
       this.handleGetAvailableConditions.bind(this);
+
+    // NPC combat-setup queries (T-SETUP)
+    CONFIG.queries[`${modulePrefix}.enrollTokensInCombat`] =
+      this.handleEnrollTokensInCombat.bind(this);
+    CONFIG.queries[`${modulePrefix}.rollNpcInitiative`] = this.handleRollNpcInitiative.bind(this);
 
     // Map generation queries (hybrid architecture)
     CONFIG.queries[`${modulePrefix}.generate-map`] = this.handleGenerateMap.bind(this);
@@ -1361,6 +1367,69 @@ export class QueryHandlers {
     } catch (error) {
       throw new Error(
         `Failed to move token: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T-SETUP — enroll NPC tokens into combat. Each token passes the shared
+   * TARGET-CHECK (category 'setup'): a PC token is rejected outright (NPC-side
+   * only), an unresolvable token errors, an NPC token proceeds. Trusted mode is
+   * irrelevant for setup (a PC target is always barred).
+   */
+  private async handleEnrollTokensInCombat(data: { tokenIds: string[] }): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+
+      if (!Array.isArray(data.tokenIds) || data.tokenIds.length === 0) {
+        throw new Error('tokenIds array is required and must not be empty');
+      }
+
+      const resolveToken = makeLiveTokenResolver();
+      for (const tokenId of data.tokenIds) {
+        const verdict = checkTarget({
+          token_id: tokenId,
+          verb: 'enroll_combatant',
+          category: 'setup',
+          trustedMode: false,
+          resolveToken,
+        });
+        if (verdict.decision === 'invalid_target') {
+          return { success: false, error: 'invalid_target', tokenId };
+        }
+        if (verdict.decision === 'rejected') {
+          return { success: false, error: verdict.error, tokenId };
+        }
+      }
+
+      return await this.dataAccess.enrollTokensInCombat({ tokenIds: data.tokenIds });
+    } catch (error) {
+      throw new Error(
+        `Failed to enroll tokens in combat: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T-SETUP — roll initiative for NPC combatants. No token target (operates on
+   * combatants already enrolled by the gated enroll verb), so no per-token gate
+   * here; the enroll step already barred any PC token.
+   */
+  private async handleRollNpcInitiative(data: { combatantIds?: string[] }): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+      return await this.dataAccess.rollNpcInitiative(data ?? {});
+    } catch (error) {
+      throw new Error(
+        `Failed to roll NPC initiative: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

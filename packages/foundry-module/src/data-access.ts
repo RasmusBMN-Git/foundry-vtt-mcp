@@ -7543,6 +7543,145 @@ export class FoundryDataAccess {
   }
 
   /**
+   * T-SETUP — enroll NPC tokens into the active combat (or create one).
+   *
+   * The genuinely-new combat-enrollment capability (the bridge had none —
+   * /bridge/npc-write-layer-SPEC.md §5.8, V1 A2). NPC-side only: every token is
+   * gated (SPEC §3) and a PC token is rejected, never enrolled by this verb.
+   * Created combatants default to the current active combat; if none exists one
+   * is created on the current scene.
+   *
+   * Note: token PLACEMENT stays in `addActorsToScene`; this verb only enrolls
+   * already-placed tokens. `actorLink` is a placement-time concern (unique NPCs
+   * only, set at creation — SPEC §5.8 / T29); this verb never toggles it.
+   */
+  async enrollTokensInCombat(data: {
+    tokenIds: string[];
+    // Injected by the query handler after the gate rejects any PC token.
+    // data-access stays free of the gate import; the handler owns wiring.
+  }): Promise<any> {
+    this.validateFoundryState();
+
+    const permissionCheck = permissionManager.checkWritePermission('modifyScene', {
+      targetIds: data.tokenIds,
+    });
+    if (!permissionCheck.allowed) {
+      throw new Error(`${ERROR_MESSAGES.ACCESS_DENIED}: ${permissionCheck.reason}`);
+    }
+
+    try {
+      const scene = (game.scenes as any).current;
+      if (!scene) {
+        throw new Error('No active scene found');
+      }
+
+      // Reuse the active combat or create one on this scene.
+      let combat = (game as any).combat;
+      if (!combat) {
+        const CombatCls = (globalThis as any).getDocumentClass('Combat');
+        combat = await CombatCls.create({ scene: scene.id });
+      }
+
+      const enrolled: Array<{ tokenId: string; combatantId: string }> = [];
+      const skipped: string[] = [];
+      const combatantData: any[] = [];
+
+      for (const tokenId of data.tokenIds) {
+        const token = scene.tokens.get(tokenId);
+        if (!token) {
+          skipped.push(tokenId);
+          continue;
+        }
+        // Already enrolled? (Combatant exists for this token.)
+        const existing = combat.combatants.find((c: any) => c.tokenId === tokenId);
+        if (existing) {
+          enrolled.push({ tokenId, combatantId: existing.id });
+          continue;
+        }
+        combatantData.push({ tokenId, sceneId: scene.id });
+      }
+
+      if (combatantData.length > 0) {
+        const created = await combat.createEmbeddedDocuments('Combatant', combatantData);
+        for (const c of created) {
+          enrolled.push({ tokenId: c.tokenId, combatantId: c.id });
+        }
+      }
+
+      this.auditLog('enrollTokensInCombat', { tokenIds: data.tokenIds }, 'success');
+      return {
+        success: true,
+        combatId: combat.id,
+        enrolled,
+        skipped: skipped.length > 0 ? skipped : undefined,
+      };
+    } catch (error) {
+      this.auditLog(
+        'enrollTokensInCombat',
+        data,
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to enroll tokens in combat: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T-SETUP — roll initiative for NPC combatants in the active combat.
+   *
+   * Wraps native `combat.rollInitiative(ids)` (or `combat.rollNPC()` when no ids
+   * are given — rolls for every NPC without initiative). NPC-side only; the
+   * handler has already gated the tokens. SPEC §5.8, V1 A2.
+   */
+  async rollNpcInitiative(data: {
+    // Combatant ids to roll. Omit/empty → roll every NPC missing initiative.
+    combatantIds?: string[];
+  }): Promise<any> {
+    this.validateFoundryState();
+
+    try {
+      const combat = (game as any).combat;
+      if (!combat) {
+        throw new Error('No active combat to roll initiative in');
+      }
+
+      let rolled: string[] = [];
+      if (data.combatantIds && data.combatantIds.length > 0) {
+        await combat.rollInitiative(data.combatantIds);
+        rolled = data.combatantIds;
+      } else {
+        // Roll for all NPCs lacking an initiative value.
+        await combat.rollNPC();
+        rolled = combat.combatants
+          .filter((c: any) => c.initiative !== null && c.actor?.hasPlayerOwner === false)
+          .map((c: any) => c.id);
+      }
+
+      const initiatives = combat.combatants.map((c: any) => ({
+        combatantId: c.id,
+        tokenId: c.tokenId,
+        name: c.name,
+        initiative: c.initiative,
+      }));
+
+      this.auditLog('rollNpcInitiative', { combatantIds: data.combatantIds }, 'success');
+      return { success: true, combatId: combat.id, rolled, initiatives };
+    } catch (error) {
+      this.auditLog(
+        'rollNpcInitiative',
+        data,
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to roll NPC initiative: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
    * Get detailed information about a token
    */
   async getTokenDetails(data: { tokenId: string }): Promise<any> {
