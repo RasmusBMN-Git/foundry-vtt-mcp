@@ -20,6 +20,11 @@ interface WaitForTurnResult {
   status: 'turn_ready' | 'timeout' | 'combat_ended';
   round: number | null;
   current_combatant: string | null;
+  // T-ID: identity of the active NPC combatant so the DM can target exactly one
+  // token. Populated on 'turn_ready'; null on 'timeout' / 'combat_ended'.
+  // Documented T24 contract amendment — see /bridge/wait-for-turn-SPEC.md §2.
+  combatant_id: string | null;
+  token_id: string | null;
 }
 
 /**
@@ -48,7 +53,7 @@ export class CombatTools {
       {
         name: 'wait-for-turn',
         description:
-          "Block until it is the DM's turn to act, then wake with the active combatant. Returns when an NPC-owned combatant becomes active (the player just ended their turn, or it was already an NPC turn), when combat ends, or when timeout_seconds elapses. This is the event-driven turn handoff (D3): make ONE call and wait — do not poll. Returns { status: 'turn_ready' | 'timeout' | 'combat_ended', round, current_combatant }. On 'timeout', call wait-for-turn again immediately to keep waiting. Read/wait only: it changes no state — read HP/positions/effects afterwards with the normal scene/character tools.",
+          "Block until it is the DM's turn to act, then wake with the active combatant. Returns when an NPC-owned combatant becomes active (the player just ended their turn, or it was already an NPC turn), when combat ends, or when timeout_seconds elapses. This is the event-driven turn handoff (D3): make ONE call and wait — do not poll. Returns { status: 'turn_ready' | 'timeout' | 'combat_ended', round, current_combatant, combatant_id, token_id }. combatant_id and token_id identify exactly which token is up (they disambiguate two same-named NPCs); both are null on 'timeout' and 'combat_ended'. On 'timeout', call wait-for-turn again immediately to keep waiting. Read/wait only: it changes no state — read HP/positions/effects afterwards with the normal scene/character tools.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -86,6 +91,8 @@ export class CombatTools {
       status: 'timeout',
       round: null,
       current_combatant: null,
+      combatant_id: null,
+      token_id: null,
     };
 
     while (true) {

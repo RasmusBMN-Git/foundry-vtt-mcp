@@ -10,6 +10,12 @@ export interface WaitForTurnResult {
   status: TurnStatus;
   round: number | null;
   current_combatant: string | null;
+  // T-ID: identity of the active combatant, so the DM can map "current_combatant"
+  // to exactly one token (two same-named NPCs are otherwise indistinguishable).
+  // Documented amendment to the T24 contract — see /bridge/wait-for-turn-SPEC.md §2.
+  // null on 'timeout' (still the PC's turn) and 'combat_ended'.
+  combatant_id: string | null;
+  token_id: string | null;
 }
 
 interface PendingWaiter {
@@ -58,7 +64,13 @@ export class CombatTurnWatcher {
     if (!this.isRegistered) return;
     for (const waiter of this.pending) {
       clearTimeout(waiter.timer);
-      waiter.resolve({ status: 'combat_ended', round: null, current_combatant: null });
+      waiter.resolve({
+        status: 'combat_ended',
+        round: null,
+        current_combatant: null,
+        combatant_id: null,
+        token_id: null,
+      });
     }
     this.pending.clear();
     this.isRegistered = false;
@@ -90,6 +102,11 @@ export class CombatTurnWatcher {
             status: 'timeout',
             round: this.currentRound(),
             current_combatant: this.currentCombatantName(),
+            // T-ID: timeout means it is still the PC's turn — no NPC combatant to
+            // identify, so identity fields stay null (mirrors current_combatant's
+            // name being the PC's, which the DM does not act on).
+            combatant_id: null,
+            token_id: null,
           });
         }, blockMs),
       };
@@ -122,7 +139,13 @@ export class CombatTurnWatcher {
     if (!combat || !combat.started) {
       return {
         wait: false,
-        result: { status: 'combat_ended', round: null, current_combatant: null },
+        result: {
+          status: 'combat_ended',
+          round: null,
+          current_combatant: null,
+          combatant_id: null,
+          token_id: null,
+        },
       };
     }
 
@@ -141,6 +164,9 @@ export class CombatTurnWatcher {
           status: 'turn_ready',
           round: combat.round ?? null,
           current_combatant: combatant.name ?? null,
+          // T-ID: Combatant#id and #tokenId identify exactly which token is up.
+          combatant_id: combatant.id ?? null,
+          token_id: combatant.tokenId ?? null,
         },
       };
     }
