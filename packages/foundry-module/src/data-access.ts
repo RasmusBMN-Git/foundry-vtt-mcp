@@ -1,6 +1,7 @@
 import { MODULE_ID, ERROR_MESSAGES, TOKEN_DISPOSITIONS } from './constants.js';
 import { permissionManager } from './permissions.js';
 import { transactionManager } from './transaction-manager.js';
+import { checkTarget, makeLiveTokenResolver } from './target-check.js';
 // Local type definitions to avoid shared package import issues
 interface CharacterInfo {
   id: string;
@@ -195,6 +196,7 @@ interface SceneInfo {
   padding: number;
   active: boolean;
   navigation: boolean;
+  grid: { size: number; distance: number };
   tokens: SceneToken[];
   walls: number;
   lights: number;
@@ -3738,6 +3740,10 @@ export class FoundryDataAccess {
       padding: scene.padding,
       active: scene.active,
       navigation: scene.navigation,
+      // T32 (SPEC §5.5) — grid size/distance so the DM can reason in grid units
+      // and so callers can pre-compute snapped move targets. V1 B4: size 100,
+      // distance 5 (ft) on the test scene.
+      grid: { size: scene.grid.size, distance: scene.grid.distance },
       tokens: scene.tokens.map((token: any) => ({
         id: token.id,
         name: token.name,
@@ -7363,7 +7369,15 @@ export class FoundryDataAccess {
   }
 
   /**
-   * Move a token to a new position on the scene
+   * Move a token to a new position on the scene.
+   *
+   * T32 (SPEC §3.1/§5.5) — move_token is category 'decision': the target-check
+   * runs first and a PC target is REJECTED outright, even under trusted mode
+   * (D2 — movement is the player's own decision, not a DM consequence).
+   * trustedMode is irrelevant to this category so it is always passed `false`.
+   * The requested `{x,y}` is snapped to the grid via native
+   * `canvas.grid.getSnappedPoint` before `token.update()` — no hand-rolled
+   * geometry (CLAUDE.md off-limits; V1 B4 confirmed this primitive live).
    */
   async moveToken(data: {
     tokenId: string;
@@ -7382,6 +7396,21 @@ export class FoundryDataAccess {
       throw new Error(`${ERROR_MESSAGES.ACCESS_DENIED}: ${permissionCheck.reason}`);
     }
 
+    const resolveToken = makeLiveTokenResolver();
+    const verdict = checkTarget({
+      token_id: data.tokenId,
+      verb: 'move_token',
+      category: 'decision',
+      trustedMode: false,
+      resolveToken,
+    });
+    if (verdict.decision === 'invalid_target') {
+      return { success: false, error: 'invalid_target', tokenId: data.tokenId };
+    }
+    if (verdict.decision === 'rejected') {
+      return { success: false, error: verdict.error, tokenId: data.tokenId };
+    }
+
     try {
       const scene = (game.scenes as any).current;
       if (!scene) {
@@ -7393,11 +7422,22 @@ export class FoundryDataAccess {
         throw new Error(`Token ${data.tokenId} not found in current scene`);
       }
 
-      // Update token position
+      const previousPosition = { x: token.x, y: token.y };
+
+      const canvasGrid = (globalThis as any).canvas?.grid;
+      if (!canvasGrid || typeof canvasGrid.getSnappedPoint !== 'function') {
+        throw new Error('Canvas grid unavailable for snapping');
+      }
+      const snapped = canvasGrid.getSnappedPoint(
+        { x: data.x, y: data.y },
+        { mode: (globalThis as any).CONST?.GRID_SNAPPING_MODES?.CENTER ?? 1 }
+      );
+
+      // Update token position (snapped, not the raw requested point)
       await token.update(
         {
-          x: data.x,
-          y: data.y,
+          x: snapped.x,
+          y: snapped.y,
         },
         { animate: data.animate !== false }
       );
@@ -7408,7 +7448,9 @@ export class FoundryDataAccess {
         success: true,
         tokenId: token.id,
         tokenName: token.name,
-        newPosition: { x: data.x, y: data.y },
+        previousPosition,
+        newPosition: { x: snapped.x, y: snapped.y },
+        requestedPosition: { x: data.x, y: data.y },
         animated: data.animate !== false,
       };
     } catch (error) {
@@ -7425,7 +7467,14 @@ export class FoundryDataAccess {
   }
 
   /**
-   * Update token properties
+   * Update token properties.
+   *
+   * T32 (SPEC §3.1/§5.5) — visibility (`hidden`) is the WRITE side of D8: gated
+   * the same as move_token (category 'decision') so Claude can freely hide/
+   * reveal NPCs but can never hide a PC's own token from its owner. Only the
+   * `hidden` field triggers the gate; other update fields (rotation, size,
+   * disposition, name, elevation, ...) are unrelated to T32 and stay ungated
+   * here, unchanged from prior behavior.
    */
   async updateToken(data: { tokenId: string; updates: Record<string, any> }): Promise<any> {
     this.validateFoundryState();
@@ -7437,6 +7486,23 @@ export class FoundryDataAccess {
 
     if (!permissionCheck.allowed) {
       throw new Error(`${ERROR_MESSAGES.ACCESS_DENIED}: ${permissionCheck.reason}`);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(data.updates, 'hidden')) {
+      const resolveToken = makeLiveTokenResolver();
+      const verdict = checkTarget({
+        token_id: data.tokenId,
+        verb: 'set_token_visibility',
+        category: 'decision',
+        trustedMode: false,
+        resolveToken,
+      });
+      if (verdict.decision === 'invalid_target') {
+        return { success: false, error: 'invalid_target', tokenId: data.tokenId };
+      }
+      if (verdict.decision === 'rejected') {
+        return { success: false, error: verdict.error, tokenId: data.tokenId };
+      }
     }
 
     try {

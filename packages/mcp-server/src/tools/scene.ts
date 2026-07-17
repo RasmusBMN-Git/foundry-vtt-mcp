@@ -112,6 +112,12 @@ export class SceneTools {
       },
       hasBackground: !!sceneData.background,
       navigation: sceneData.navigation,
+      // T32 (SPEC §5.5) — grid size/distance so the DM can reason in grid
+      // units when planning NPC moves (moves are snapped server-side anyway).
+      grid: {
+        size: sceneData.grid?.size,
+        distance: sceneData.grid?.distance,
+      },
       elements: {
         walls: sceneData.walls || 0,
         lights: sceneData.lights || 0,

@@ -264,6 +264,11 @@ export class TokenManipulationTools {
     ];
   }
 
+  // T32: move a token, grid-snapped. NPC target applies immediately; a PC
+  // target is REJECTED outright (category 'decision', D2 — movement stays a
+  // player decision even under trusted mode). The Foundry side gates and
+  // snaps; this handler surfaces a gate rejection as an error rather than a
+  // silent success (SPEC §3: "never a silent write").
   async handleMoveToken(args: any): Promise<any> {
     const schema = z.object({
       tokenId: z.string(),
@@ -277,19 +282,26 @@ export class TokenManipulationTools {
     this.logger.info('Moving token', { tokenId, x, y, animate });
 
     try {
-      const result = await this.foundryClient.query('foundry-mcp-bridge.move-token', {
+      const result: any = await this.foundryClient.query('foundry-mcp-bridge.move-token', {
         tokenId,
         x,
         y,
         animate,
       });
 
+      if (result && result.success === false) {
+        this.logger.warn('Move token rejected by target-check', result);
+        throw new Error(`Cannot move token ${result.tokenId ?? tokenId}: ${result.error}`);
+      }
+
       this.logger.debug('Token moved successfully', { tokenId });
 
       return {
         success: true,
         tokenId,
-        newPosition: { x, y },
+        previousPosition: result?.previousPosition,
+        newPosition: result?.newPosition ?? { x, y },
+        requestedPosition: { x, y },
         animated: animate,
       };
     } catch (error) {
@@ -300,6 +312,10 @@ export class TokenManipulationTools {
     }
   }
 
+  // T32: `hidden` is the WRITE side of D8 and is gated (category 'decision') —
+  // an NPC target applies immediately; a PC target is REJECTED outright (never
+  // hide a player's own token from them). Other update fields are unrelated to
+  // T32 and stay ungated, unchanged from prior behavior.
   async handleUpdateToken(args: any): Promise<any> {
     const schema = z.object({
       tokenId: z.string(),
@@ -322,10 +338,15 @@ export class TokenManipulationTools {
     this.logger.info('Updating token', { tokenId, updates });
 
     try {
-      const result = await this.foundryClient.query('foundry-mcp-bridge.update-token', {
+      const result: any = await this.foundryClient.query('foundry-mcp-bridge.update-token', {
         tokenId,
         updates,
       });
+
+      if (result && result.success === false) {
+        this.logger.warn('Update token rejected by target-check', result);
+        throw new Error(`Cannot update token ${result.tokenId ?? tokenId}: ${result.error}`);
+      }
 
       this.logger.debug('Token updated successfully', { tokenId, result });
 
