@@ -210,6 +210,57 @@ export class TokenManipulationTools {
           },
         },
       },
+      {
+        name: 'apply-damage',
+        description:
+          "Apply typed damage (or healing, via a negative multiplier) to a token's HP. Runs the target's native resistance/vulnerability/immunity and temp-HP math (the same path the chat-card 'apply damage' button uses) — never a raw HP write. Targeting an NPC/monster applies immediately. Targeting the PC returns a needs_approval response (D4) unless trustedMode is set, in which case it applies automatically (the DM owns PC consequences; PC decisions like movement and rolls are never auto-applied). Damage must be passed explicitly as typed entries — this tool never parses a chat card.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tokenId: {
+              type: 'string',
+              description: 'The scene token ID to damage or heal.',
+            },
+            damage: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  value: { type: 'number', description: 'Damage amount (positive).' },
+                  type: {
+                    type: 'string',
+                    description: 'Damage type, e.g. "slashing", "fire", "cold".',
+                  },
+                },
+                required: ['value', 'type'],
+              },
+              description: 'One or more typed damage entries to apply.',
+            },
+            multiplier: {
+              type: 'number',
+              description:
+                'Damage multiplier. 1 = normal damage (default). -1 = heal the same amount.',
+              default: 1,
+            },
+            trustedMode: {
+              type: 'boolean',
+              description:
+                'Set true only when the session header declares trusted mode. Lets a PC-target consequence auto-apply instead of returning needs_approval. Never set for PC decisions (movement/rolls) — those are barred regardless.',
+              default: false,
+            },
+          },
+          required: ['tokenId', 'damage'],
+        },
+      },
+      {
+        name: 'advance-turn',
+        description:
+          "Advance the active combat to the next combatant's turn (native nextTurn). Pure NPC-side turn bookkeeping — no target, no approval. Honors Foundry's skipDefeated setting, so dead combatants are skipped automatically. Never use this to take, skip, or resolve the PC's own turn: the player always takes their turn in Foundry (D2). Returns the previous and current combatant plus the round.",
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
     ];
   }
 
@@ -510,6 +561,66 @@ export class TokenManipulationTools {
       this.logger.error('Failed to roll NPC initiative', error);
       throw new Error(
         `Failed to roll NPC initiative: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  // T31: apply typed damage/healing. NPC target applies immediately; PC target
+  // returns a needs_approval payload (D4) unless trustedMode is set. This
+  // handler does NOT throw on needs_approval/rejected/invalid_target — those
+  // are valid, defined outcomes the DM must see and act on, not tool failures.
+  async handleApplyDamage(args: any): Promise<any> {
+    const schema = z.object({
+      tokenId: z.string(),
+      damage: z.array(z.object({ value: z.number(), type: z.string() })).min(1),
+      multiplier: z.number().optional().default(1),
+      trustedMode: z.boolean().optional().default(false),
+    });
+
+    const { tokenId, damage, multiplier, trustedMode } = schema.parse(args);
+
+    this.logger.info('Applying damage', { tokenId, damage, multiplier, trustedMode });
+
+    try {
+      const result: any = await this.foundryClient.query('foundry-mcp-bridge.applyDamage', {
+        tokenId,
+        damage,
+        multiplier,
+        trustedMode,
+      });
+
+      if (result && result.success === false && result.error === 'invalid_target') {
+        this.logger.warn('apply-damage: invalid target', result);
+        throw new Error(`Cannot apply damage: invalid target ${result.tokenId ?? tokenId}`);
+      }
+      if (result && result.status === 'needs_approval') {
+        this.logger.info('apply-damage: PC target needs approval', result);
+        return result; // pass the D4 approval-request shape straight through
+      }
+
+      this.logger.debug('Damage applied', { tokenId });
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to apply damage', error);
+      throw new Error(
+        `Failed to apply damage: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  // T-ADV: advance the active combat to the next turn. Pure NPC-side turn
+  // bookkeeping — no target, no gate, no approval (SPEC §3.1). Takes no args.
+  async handleAdvanceTurn(_args: any): Promise<any> {
+    this.logger.info('Advancing turn');
+
+    try {
+      const result: any = await this.foundryClient.query('foundry-mcp-bridge.advanceTurn', {});
+      this.logger.debug('Turn advanced', { current: result?.current?.combatantId });
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to advance turn', error);
+      throw new Error(
+        `Failed to advance turn: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

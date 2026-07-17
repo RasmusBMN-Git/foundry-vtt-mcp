@@ -110,6 +110,12 @@ export class QueryHandlers {
       this.handleEnrollTokensInCombat.bind(this);
     CONFIG.queries[`${modulePrefix}.rollNpcInitiative`] = this.handleRollNpcInitiative.bind(this);
 
+    // HP sync (T31)
+    CONFIG.queries[`${modulePrefix}.applyDamage`] = this.handleApplyDamage.bind(this);
+
+    // Turn bookkeeping (T-ADV)
+    CONFIG.queries[`${modulePrefix}.advanceTurn`] = this.handleAdvanceTurn.bind(this);
+
     // Map generation queries (hybrid architecture)
     CONFIG.queries[`${modulePrefix}.generate-map`] = this.handleGenerateMap.bind(this);
     CONFIG.queries[`${modulePrefix}.check-map-status`] = this.handleCheckMapStatus.bind(this);
@@ -1430,6 +1436,87 @@ export class QueryHandlers {
     } catch (error) {
       throw new Error(
         `Failed to roll NPC initiative: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T31 — apply_damage. Gated (SPEC §3, category 'consequence'): an NPC target
+   * applies automatically; a PC target returns the shared D4 approval-request
+   * unless `trustedMode` is true (the session-header posture, D4 addendum —
+   * DM owns PC consequences). An invalid target errors, never a silent write.
+   */
+  private async handleApplyDamage(data: {
+    tokenId: string;
+    damage: Array<{ value: number; type: string }>;
+    multiplier?: number;
+    trustedMode?: boolean;
+  }): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+
+      if (!data.tokenId || !Array.isArray(data.damage) || data.damage.length === 0) {
+        throw new Error('tokenId and a non-empty damage array are required');
+      }
+
+      const resolveToken = makeLiveTokenResolver();
+      const verdict = checkTarget({
+        token_id: data.tokenId,
+        verb: 'apply_damage',
+        category: 'consequence',
+        trustedMode: data.trustedMode === true,
+        proposed: { damage: data.damage, multiplier: data.multiplier ?? 1 },
+        resolveToken,
+      });
+
+      if (verdict.decision === 'invalid_target') {
+        return { success: false, error: 'invalid_target', tokenId: data.tokenId };
+      }
+      if (verdict.decision === 'needs_approval') {
+        // No write performed. The caller (DM) re-issues with an explicit
+        // approval flag once the player approves — that re-issue is a plain
+        // trustedMode:false call after out-of-band approval; the bridge itself
+        // has no separate "approved" transport (SPEC §4: Claude-Desktop
+        // per-tool permission is the approval transport, not a second round-trip).
+        return verdict.approval;
+      }
+      // 'rejected' cannot occur for category 'consequence' (only 'decision' /
+      // 'action' / 'setup' reject); 'auto' is the only remaining case.
+
+      return await this.dataAccess.applyDamageToToken({
+        tokenId: data.tokenId,
+        damage: data.damage,
+        ...(data.multiplier !== undefined ? { multiplier: data.multiplier } : {}),
+      });
+    } catch (error) {
+      throw new Error(
+        `Failed to apply damage: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T-ADV — advance_turn. Pure NPC-side turn bookkeeping (SPEC §3.1, category
+   * 'bookkeeping'): no PC target, so no target-check gate and no D4 approval —
+   * it only advances whose turn it is. Honors the native skipDefeated setting
+   * (folds in the T28 dead-combatant-skip finding). Never acts for or skips the
+   * PC's own turn (D2): the player still takes their turn in Foundry.
+   */
+  private async handleAdvanceTurn(): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+      return await this.dataAccess.advanceTurn();
+    } catch (error) {
+      throw new Error(
+        `Failed to advance turn: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

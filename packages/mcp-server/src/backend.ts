@@ -1746,6 +1746,16 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'apply-damage':
+                  result = await tokenManipulationTools.handleApplyDamage(args);
+
+                  break;
+
+                case 'advance-turn':
+                  result = await tokenManipulationTools.handleAdvanceTurn(args);
+
+                  break;
+
                 // Map generation tools
 
                 case 'generate-map':

@@ -7543,6 +7543,132 @@ export class FoundryDataAccess {
   }
 
   /**
+   * T-ADV — advance the combat tracker to the next combatant.
+   *
+   * Wraps native `combat.nextTurn()` directly — the bridge has no existing
+   * turn-advance verb to wrap (grep confirms zero combat methods, SPEC §5.4).
+   * Honors the native `skipDefeated` combat-tracker setting (do NOT hand-roll
+   * skip logic — folds in the T28 dead-combatant-skip finding for free).
+   *
+   * No PC target: this is turn bookkeeping, not a PC-affecting write, so it
+   * carries no gate check (SPEC §3.1: category 'bookkeeping', always auto).
+   * Never used to act for or skip the PC's own turn (D2) — it only advances
+   * whose turn it is; the player still takes their turn in Foundry.
+   */
+  async advanceTurn(): Promise<any> {
+    this.validateFoundryState();
+
+    try {
+      const combat = (game as any).combat;
+      if (!combat) {
+        throw new Error('No active combat to advance');
+      }
+
+      const before = combat.combatant
+        ? {
+            combatantId: combat.combatant.id,
+            tokenId: combat.combatant.tokenId,
+            round: combat.round,
+          }
+        : null;
+
+      await combat.nextTurn();
+
+      const after = combat.combatant
+        ? {
+            combatantId: combat.combatant.id,
+            tokenId: combat.combatant.tokenId,
+            name: combat.combatant.name,
+            round: combat.round,
+            isDefeated: combat.combatant.isDefeated ?? false,
+          }
+        : null;
+
+      this.auditLog('advanceTurn', { from: before }, 'success');
+      return { success: true, previous: before, current: after };
+    } catch (error) {
+      this.auditLog(
+        'advanceTurn',
+        {},
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to advance turn: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T31 — apply typed damage/healing to a token's HP.
+   *
+   * Calls `actor.applyDamage([{value, type}], {multiplier})` on the target's
+   * SYNTHETIC `token.actor` — NOT a raw `hp.value` write. This is the same path
+   * the chat-card "apply damage" button uses: it runs dnd5e's resistance /
+   * vulnerability / immunity math and respects temp HP natively (V1 B1, SPEC
+   * §5.1). Using `token.actor` (rather than looking the actor up by name) keeps
+   * identical unlinked NPCs independent. Heal via `multiplier: -1`.
+   *
+   * Gating happens in the query handler (SPEC §3: category 'consequence'),
+   * before this method is ever called — this method assumes the target-check
+   * already passed.
+   */
+  async applyDamageToToken(data: {
+    tokenId: string;
+    damage: Array<{ value: number; type: string }>;
+    multiplier?: number;
+  }): Promise<any> {
+    this.validateFoundryState();
+
+    try {
+      const scene = (game.scenes as any).current;
+      if (!scene) {
+        throw new Error('No active scene found');
+      }
+
+      const token = scene.tokens.get(data.tokenId);
+      if (!token) {
+        throw new Error(`Token ${data.tokenId} not found in current scene`);
+      }
+      const actor = (token as any).actor;
+      if (!actor || typeof actor.applyDamage !== 'function') {
+        throw new Error(`Token ${data.tokenId} has no actor with applyDamage support`);
+      }
+
+      const before = actor.system?.attributes?.hp?.value ?? null;
+      await actor.applyDamage(data.damage, { multiplier: data.multiplier ?? 1 });
+      const after = actor.system?.attributes?.hp?.value ?? null;
+
+      this.auditLog(
+        'applyDamageToToken',
+        { tokenId: data.tokenId, damage: data.damage, multiplier: data.multiplier },
+        'success'
+      );
+
+      return {
+        success: true,
+        tokenId: data.tokenId,
+        tokenName: token.name,
+        hpBefore: before,
+        hpAfter: after,
+        delta: before !== null && after !== null ? before - after : null,
+        damage: data.damage,
+        multiplier: data.multiplier ?? 1,
+      };
+    } catch (error) {
+      this.auditLog(
+        'applyDamageToToken',
+        data,
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to apply damage: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
    * T-SETUP — enroll NPC tokens into the active combat (or create one).
    *
    * The genuinely-new combat-enrollment capability (the bridge had none —
