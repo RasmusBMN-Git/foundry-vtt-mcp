@@ -7925,12 +7925,29 @@ export class FoundryDataAccess {
   }
 
   /**
-   * Toggle a status condition on a token
+   * Toggle a status condition on a token.
+   *
+   * T34 (SPEC §5.6): the write path is native v11+ `actor.toggleStatusEffect`,
+   * NOT hand-rolled `createEmbeddedDocuments`/`deleteEmbeddedDocuments` — the
+   * built-in path is what `duration.remaining`/`isTemporary` read correctly
+   * off afterwards (V1 B5). A bare toggle carries **no duration**
+   * (`remaining: null`); `durationRounds` sets one explicitly for save-ends /
+   * timed effects, keyed to the active combat's current round/turn so
+   * `duration.remaining` ticks down naturally. Gating (target-check, category
+   * 'consequence') happens in the query handler before this method is ever
+   * called — this method assumes the check already passed (same contract as
+   * `applyDamageToToken`).
+   *
+   * The non-dnd5e (DSA5) manual ActiveEffect path is kept as a fallback only
+   * when the actor has no `toggleStatusEffect` (older/other systems) — this
+   * project's stack is dnd5e (CLAUDE.md), so that branch is not exercised
+   * here but stays to avoid regressing the bridge's other supported systems.
    */
   async toggleTokenCondition(data: {
     tokenId: string;
     conditionId: string;
     active: boolean;
+    durationRounds?: number;
   }): Promise<any> {
     this.validateFoundryState();
 
@@ -7970,22 +7987,42 @@ export class FoundryDataAccess {
         throw new Error(`Condition not found: ${data.conditionId}`);
       }
 
-      if (data.active) {
-        // Add the condition - handle DSA5 and other systems
+      let appliedDurationRounds: number | null = null;
+
+      if (typeof actor.toggleStatusEffect === 'function') {
+        // Native path (SPEC §5.6).
+        await actor.toggleStatusEffect(condition.id ?? data.conditionId, {
+          active: data.active,
+        });
+
+        if (data.active && data.durationRounds) {
+          // Find the effect toggleStatusEffect just created and set an
+          // explicit round-based duration on it — a bare toggle has none.
+          const effect = (actor.effects?.contents || []).find((e: any) =>
+            e.statuses?.has(condition.id ?? data.conditionId)
+          );
+          if (effect) {
+            const combat = (game as any).combat;
+            await effect.update({
+              duration: {
+                rounds: data.durationRounds,
+                startRound: combat?.round ?? null,
+                startTurn: combat?.turn ?? null,
+              },
+            });
+            appliedDurationRounds = data.durationRounds;
+          }
+        }
+      } else if (data.active) {
+        // Fallback for systems without toggleStatusEffect (e.g. older DSA5).
         const effectData: any = {
           name: condition.name || condition.label || condition.id,
           icon: condition.icon || condition.img,
         };
-
-        // Add statuses for systems that support it (D&D5e, PF2e)
         if (condition.id) {
           effectData.statuses = [condition.id];
         }
-
-        // DSA5-specific: Copy all properties from the condition
-        // DSA5 conditions have different structure than D&D5e/PF2e
         if ((game.system as any)?.id === 'dsa5') {
-          // For DSA5, use the condition's full data structure
           Object.assign(effectData, {
             flags: condition.flags || {},
             changes: condition.changes || [],
@@ -7993,27 +8030,15 @@ export class FoundryDataAccess {
             origin: condition.origin,
           });
         }
-
         await actor.createEmbeddedDocuments('ActiveEffect', [effectData]);
       } else {
-        // Remove the condition
         const effects = actor.effects?.contents || [];
         const effectsToRemove = effects.filter((effect: any) => {
-          // Check by status (D&D5e, PF2e)
-          if (effect.statuses?.has(data.conditionId)) {
-            return true;
-          }
-          // Check by name (fallback for all systems including DSA5)
-          if (effect.name?.toLowerCase() === data.conditionId.toLowerCase()) {
-            return true;
-          }
-          // Check by label (some systems use label instead of name)
-          if (effect.label?.toLowerCase() === data.conditionId.toLowerCase()) {
-            return true;
-          }
+          if (effect.statuses?.has(data.conditionId)) return true;
+          if (effect.name?.toLowerCase() === data.conditionId.toLowerCase()) return true;
+          if (effect.label?.toLowerCase() === data.conditionId.toLowerCase()) return true;
           return false;
         });
-
         if (effectsToRemove.length > 0) {
           await actor.deleteEmbeddedDocuments(
             'ActiveEffect',
@@ -8032,6 +8057,7 @@ export class FoundryDataAccess {
         conditionName: condition.name || condition.label || condition.id,
         isActive: data.active,
         active: data.active,
+        durationRounds: appliedDurationRounds,
         message: data.active
           ? `Applied ${data.conditionId} to ${token.name}`
           : `Removed ${data.conditionId} from ${token.name}`,
@@ -8045,6 +8071,81 @@ export class FoundryDataAccess {
       );
       throw new Error(
         `Failed to toggle token condition: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T34 — roll an NPC's pending save-ends save and clear the condition on
+   * success (SPEC §5.6: "T34 must fold in an NPC-roll path for save-ends
+   * resolution ... it is not a separate task"). Rolls via the native
+   * `actor.rollSavingThrow({ability}, {configure:false}, {create:true})` —
+   * the same no-dialog pattern T33 uses for the attack Activity (SPEC §5.2) —
+   * so the roll posts to chat with no GM prompt. NPC-only: the query handler
+   * gates the target (category 'action') and rejects a PC target outright
+   * before this method is ever called — Claude never rolls a PC's save (D2).
+   */
+  async resolveSaveEndsCondition(data: {
+    tokenId: string;
+    conditionId: string;
+    ability: string;
+    dc: number;
+  }): Promise<any> {
+    this.validateFoundryState();
+
+    try {
+      const scene = (game.scenes as any).current;
+      if (!scene) {
+        throw new Error('No active scene found');
+      }
+
+      const token = scene.tokens.get(data.tokenId);
+      if (!token) {
+        throw new Error(`Token ${data.tokenId} not found in current scene`);
+      }
+
+      const actor = token.actor;
+      if (!actor || typeof actor.rollSavingThrow !== 'function') {
+        throw new Error(`Token ${data.tokenId} has no actor with rollSavingThrow support`);
+      }
+
+      const rolls = await actor.rollSavingThrow(
+        { ability: data.ability },
+        { configure: false },
+        { create: true }
+      );
+      const roll = Array.isArray(rolls) ? rolls[0] : rolls;
+      const rollTotal: number | null = roll?.total ?? null;
+      const saveSucceeded = rollTotal !== null ? rollTotal >= data.dc : false;
+
+      let conditionCleared = false;
+      if (saveSucceeded && typeof actor.toggleStatusEffect === 'function') {
+        await actor.toggleStatusEffect(data.conditionId, { active: false });
+        conditionCleared = true;
+      }
+
+      this.auditLog('resolveSaveEndsCondition', data, 'success');
+
+      return {
+        success: true,
+        tokenId: token.id,
+        tokenName: token.name,
+        conditionId: data.conditionId,
+        ability: data.ability,
+        dc: data.dc,
+        rollTotal,
+        saveSucceeded,
+        conditionCleared,
+      };
+    } catch (error) {
+      this.auditLog(
+        'resolveSaveEndsCondition',
+        data,
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to resolve save-ends condition: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }
@@ -8115,6 +8216,19 @@ export class FoundryDataAccess {
       throw new Error(`Actor not found: ${actorIdentifier}`);
     }
 
+    // T33 (SPEC §5): use-item is never allowed to fire a PC's own items —
+    // that's a D2 player decision, barred unconditionally (no trustedMode
+    // override, unlike a consequence). NPC actions fire through the
+    // dedicated executeNpcAbility verb (the attack/spell Activity path);
+    // this path stays for the non-activity/legacy item-use fallback.
+    if (actor.hasPlayerOwner === true) {
+      return {
+        success: false,
+        status: 'rejected',
+        message: `Refusing to use "${itemIdentifier}" on PC actor "${actor.name}": firing a PC's own items is a player decision (D2), never a Claude action.`,
+      } as any;
+    }
+
     // Find the item on the actor
     const item = actor.items.find(
       (i: any) => i.id === itemIdentifier || i.name.toLowerCase() === itemIdentifier.toLowerCase()
@@ -8173,9 +8287,12 @@ export class FoundryDataAccess {
         }
       }
 
-      // Set targets using Foundry's targeting system
-      if (tokenIds.length > 0 && game.user) {
-        await (game.user as any).updateTokenTargets(tokenIds);
+      // Set targets using Foundry's targeting system. T33 (SPEC §5.3):
+      // `game.user.updateTokenTargets` was removed in v13 (broken on 14.364,
+      // V1 A7) — `canvas.tokens.setTargets(ids)` is the replacement
+      // (verified live, V1 B3).
+      if (tokenIds.length > 0 && (globalThis as any).canvas?.tokens?.setTargets) {
+        (globalThis as any).canvas.tokens.setTargets(tokenIds);
         console.log(`[foundry-mcp-bridge] Set targets: ${resolvedTargetNames.join(', ')}`);
       }
     }
@@ -8319,6 +8436,276 @@ export class FoundryDataAccess {
 
       throw new Error(
         `Failed to use item "${item.name}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T33 — fire an NPC's attack/spell through the Activity API with
+   * `configure:false` (SPEC §5.2), NOT `useItem` (which forces
+   * `configureDialog:true` and returns `requiresGMInteraction:true`, V1 A6).
+   * Native dnd5e rolls the attack/damage to chat with no GM dialog, spends
+   * the slot, drops any area template.
+   *
+   * Targeting uses `canvas.tokens.setTargets` (SPEC §5.3, the v14 replacement
+   * for the removed `game.user.updateTokenTargets`).
+   *
+   * PC saving throws (D2): if the fired activity is a **save**-type activity
+   * (no attack activity present) and a target resolves to a PC, this method
+   * does NOT roll that save — it hands it to the player via the existing
+   * `requestPlayerRolls` verb and reports the pending request. Claude reads
+   * the result later; it never rolls a PC's save itself.
+   *
+   * Gating (PC as the ACTING actor → reject) happens in the query handler
+   * (SPEC §3, category 'action') before this method is ever called — same
+   * contract as every other write verb. This method assumes the acting
+   * token is already confirmed NPC.
+   *
+   * Known limit (SPEC §5.2, dnd5e #4843/#4844): forcing advantage/critical
+   * through the activity API is awkward. For the common straight attack +
+   * apply-damage flow this path is clean; the roll-dice + apply_damage (T31)
+   * path stays as the fallback only where the activity can't express the
+   * effect.
+   */
+  async executeNpcAbility(data: {
+    tokenId: string;
+    itemIdentifier: string;
+    targetTokenIds?: string[];
+  }): Promise<any> {
+    this.validateFoundryState();
+
+    try {
+      const scene = (game.scenes as any).current;
+      if (!scene) {
+        throw new Error('No active scene found');
+      }
+
+      const token = scene.tokens.get(data.tokenId);
+      if (!token) {
+        throw new Error(`Token ${data.tokenId} not found in current scene`);
+      }
+
+      const actor = (token as any).actor;
+      if (!actor) {
+        throw new Error(`Token ${data.tokenId} has no associated actor`);
+      }
+
+      const item = actor.items.find(
+        (i: any) =>
+          i.id === data.itemIdentifier ||
+          i.name?.toLowerCase() === data.itemIdentifier.toLowerCase()
+      );
+      if (!item) {
+        throw new Error(`Item "${data.itemIdentifier}" not found on actor "${actor.name}"`);
+      }
+
+      // T33 (SPEC §5.3): canvas.tokens.setTargets replaces the removed
+      // game.user.updateTokenTargets (v14 break, V1 A7/B3).
+      if (
+        data.targetTokenIds &&
+        data.targetTokenIds.length > 0 &&
+        (globalThis as any).canvas?.tokens?.setTargets
+      ) {
+        (globalThis as any).canvas.tokens.setTargets(data.targetTokenIds);
+      }
+
+      const activities = (item as any).system?.activities;
+      const attackActivity = activities?.getByType?.('attack')?.[0];
+      const saveActivity = activities?.getByType?.('save')?.[0];
+      const activity = attackActivity ?? saveActivity;
+
+      if (!activity || typeof activity.use !== 'function') {
+        throw new Error(
+          `Item "${item.name}" has no attack/save Activity to fire (T30a: use-item is not the NPC-ability path)`
+        );
+      }
+
+      // Save-forcing spell with no attack roll: hand PC targets off to the
+      // player (D2) rather than resolving the save here.
+      let pcSaveRequested: { targetName: string; ability: string } | null = null;
+      if (saveActivity && !attackActivity && data.targetTokenIds?.length) {
+        const resolveToken = makeLiveTokenResolver();
+        const abilityRaw = (saveActivity as any).save?.ability;
+        const ability = Array.isArray(abilityRaw) ? abilityRaw[0] : (abilityRaw ?? 'con');
+        for (const tid of data.targetTokenIds) {
+          const resolved = resolveToken(tid);
+          if (resolved?.isPC) {
+            await this.requestPlayerRolls({
+              rollType: 'save',
+              rollTarget: String(ability),
+              targetPlayer: resolved.name ?? tid,
+              isPublic: true,
+              rollModifier: '',
+              flavor: `${actor.name} forces a ${String(ability).toUpperCase()} save (${item.name})`,
+            });
+            pcSaveRequested = { targetName: resolved.name ?? tid, ability: String(ability) };
+          }
+        }
+      }
+
+      const chatResult = await activity.use({}, { configure: false }, { create: true });
+
+      this.auditLog(
+        'executeNpcAbility',
+        {
+          tokenId: data.tokenId,
+          itemId: item.id,
+          itemName: item.name,
+          targetTokenIds: data.targetTokenIds,
+        },
+        'success'
+      );
+
+      return {
+        success: true,
+        tokenId: token.id,
+        tokenName: token.name,
+        itemName: item.name,
+        activityType: attackActivity ? 'attack' : 'save',
+        targets: data.targetTokenIds ?? [],
+        pcSaveRequested,
+        chatMessageCreated: !!chatResult,
+      };
+    } catch (error) {
+      this.auditLog(
+        'executeNpcAbility',
+        data,
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to execute NPC ability: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T35 (conditional, gate-passed 2026-07-17 via live probe against the
+   * Testlab scene) — apply a persistent-AoE template's damage/condition to
+   * every occupant. Occupancy is the native
+   * `templatePlaceable.testPoint({x,y})` (confirmed live: correctly
+   * distinguished a point 7.5ft from center — inside a 10ft-radius circle —
+   * from one at 12.5ft — outside). `_refreshShape()` is called defensively
+   * first since a template created via `createEmbeddedDocuments` outside the
+   * normal canvas draw cycle doesn't have `shape` populated yet; by the time
+   * a real tick fires (via `wait_for_turn`, well after template creation)
+   * this is already a no-op.
+   *
+   * SPEC §3.1: the tick call itself is category 'bookkeeping' (no single
+   * acting/target token — the template is the target, not a token) so it
+   * carries no target-check of its own (same as `advanceTurn`). Each
+   * occupant found inside the template IS individually gated as category
+   * 'consequence' (SPEC table: "consequence if it lands on the PC") — an NPC
+   * occupant applies automatically; a PC occupant needs D4 approval unless
+   * trustedMode. Reuses `applyDamageToToken`/`toggleTokenCondition` directly
+   * (not their gated query wrappers) since the gate already ran here — same
+   * contract those methods use everywhere else.
+   *
+   * Durable-state bookkeeping (which templates are active, when they expire)
+   * is brief/journal logic (T27), not this method's job — same split T34
+   * used for save-ends duration tracking.
+   */
+  async tickPersistentAoeTemplate(data: {
+    templateId: string;
+    damage?: Array<{ value: number; type: string }>;
+    conditionId?: string;
+    durationRounds?: number;
+    trustedMode?: boolean;
+  }): Promise<any> {
+    this.validateFoundryState();
+
+    try {
+      const scene = (game.scenes as any).current;
+      if (!scene) {
+        throw new Error('No active scene found');
+      }
+
+      const templateDoc = scene.templates?.get(data.templateId);
+      if (!templateDoc) {
+        throw new Error(`Template ${data.templateId} not found in current scene`);
+      }
+      const placeable = (templateDoc as any).object;
+      if (!placeable || typeof placeable.testPoint !== 'function') {
+        // The conditional gate: no native occupancy test → do not hand-roll
+        // point-in-template geometry (CLAUDE.md off-limits). Caller should
+        // treat this as the D1 reopen signal (route to T21).
+        throw new Error(
+          `Template ${data.templateId} has no native testPoint occupancy test on this world`
+        );
+      }
+      if (!placeable.shape && typeof placeable._refreshShape === 'function') {
+        placeable._refreshShape();
+      }
+
+      const resolveToken = makeLiveTokenResolver();
+      const tokenPlaceables = (globalThis as any).canvas?.tokens?.placeables ?? [];
+      const occupants: any[] = [];
+
+      for (const token of tokenPlaceables) {
+        if (!token.actor) continue;
+        const point = token.center ?? { x: token.x, y: token.y };
+        if (!placeable.testPoint(point)) continue;
+
+        const verdict = checkTarget({
+          token_id: token.id,
+          verb: 'persistent_aoe_tick',
+          category: 'consequence',
+          trustedMode: data.trustedMode === true,
+          proposed: { damage: data.damage, conditionId: data.conditionId },
+          resolveToken,
+        });
+
+        if (verdict.decision === 'invalid_target') {
+          occupants.push({ tokenId: token.id, tokenName: token.name, decision: 'invalid_target' });
+          continue;
+        }
+        if (verdict.decision === 'needs_approval') {
+          occupants.push({
+            tokenId: token.id,
+            tokenName: token.name,
+            decision: 'needs_approval',
+            approval: verdict.approval,
+          });
+          continue; // no write performed until approved
+        }
+
+        const applied: any = { tokenId: token.id, tokenName: token.name, decision: 'auto' };
+        if (data.damage && data.damage.length > 0) {
+          const dmgResult = await this.applyDamageToToken({
+            tokenId: token.id,
+            damage: data.damage,
+          });
+          applied.hpBefore = dmgResult.hpBefore;
+          applied.hpAfter = dmgResult.hpAfter;
+        }
+        if (data.conditionId) {
+          const condResult = await this.toggleTokenCondition({
+            tokenId: token.id,
+            conditionId: data.conditionId,
+            active: true,
+            ...(data.durationRounds !== undefined ? { durationRounds: data.durationRounds } : {}),
+          });
+          applied.conditionApplied = condResult.conditionName;
+        }
+        occupants.push(applied);
+      }
+
+      this.auditLog(
+        'tickPersistentAoeTemplate',
+        { templateId: data.templateId, occupantCount: occupants.length },
+        'success'
+      );
+
+      return { success: true, templateId: data.templateId, occupants };
+    } catch (error) {
+      this.auditLog(
+        'tickPersistentAoeTemplate',
+        data,
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to tick persistent AoE template: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

@@ -147,7 +147,7 @@ export class TokenManipulationTools {
       {
         name: 'toggle-token-condition',
         description:
-          'Toggle a status effect/condition on or off for a token. Use this to apply or remove conditions like Prone, Poisoned, Blinded, etc.',
+          'Toggle a status effect/condition on or off for a token. Use this to apply or remove conditions like Prone, Poisoned, Blinded, etc. Targeting an NPC/monster applies immediately. Targeting the PC returns a needs_approval response (D4) unless trustedMode is set, in which case it applies automatically — the DM owns PC consequences (HP, conditions). Pass durationRounds for a save-ends/timed condition (a bare toggle otherwise carries no duration).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -164,6 +164,17 @@ export class TokenManipulationTools {
               type: 'boolean',
               description:
                 'Optional: true to add the condition, false to remove it. If not specified, will toggle the current state.',
+            },
+            durationRounds: {
+              type: 'number',
+              description:
+                'Optional: for a save-ends or otherwise timed condition, the number of rounds the effect lasts. Only meaningful when active is true.',
+            },
+            trustedMode: {
+              type: 'boolean',
+              description:
+                'Set true only when the session header declares trusted mode. Lets a PC-target condition auto-apply instead of returning needs_approval.',
+              default: false,
             },
           },
           required: ['tokenId', 'conditionId'],
@@ -259,6 +270,99 @@ export class TokenManipulationTools {
         inputSchema: {
           type: 'object',
           properties: {},
+        },
+      },
+      {
+        name: 'use-npc-ability',
+        description:
+          "Fire an NPC's attack or spell through its attack/save Activity (no GM dialog) — rolls to chat and spends the slot automatically. This is NOT use-item: use-item forces a configuration dialog and returns requiresGMInteraction, this tool does not. NPC-only as the actor: a PC token as the acting actor is rejected outright regardless of trustedMode (D2 — Claude never fires the PC's own items). Damage/conditions landing on a target are NOT applied by this tool — read the chat result and follow up with apply-damage / toggle-token-condition under their own gate. If the fired ability is a save (not an attack) and a target is the PC, this tool automatically posts a roll request to the player via request-player-rolls instead of rolling the PC's save itself (D2) — the response's pcSaveRequested field reports this.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tokenId: {
+              type: 'string',
+              description: 'The scene token ID of the NPC using the ability (the acting actor).',
+            },
+            itemIdentifier: {
+              type: 'string',
+              description: "The item's ID or name on the NPC's actor (the attack/spell to fire).",
+            },
+            targetTokenIds: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Optional: scene token IDs to target (sets canvas targets before firing, the v14 canvas.tokens.setTargets path).',
+            },
+          },
+          required: ['tokenId', 'itemIdentifier'],
+        },
+      },
+      {
+        name: 'tick-persistent-aoe',
+        description:
+          "Apply a persistent-AoE template's damage/condition to every token currently inside it (native template occupancy test, e.g. Cloud of Daggers). Call this on entry into the zone and again at the start of each creature's turn per the effect's trigger — NOT at end of turn. NPC occupants apply immediately. A PC occupant returns needs_approval (D4) unless trustedMode, in which case it applies automatically — landing in the zone is a consequence the DM owns. Returns one entry per occupant found, each reporting its own decision (auto / needs_approval / invalid_target).",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            templateId: {
+              type: 'string',
+              description: 'The scene MeasuredTemplate ID of the active persistent-AoE zone.',
+            },
+            damage: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  value: { type: 'number', description: 'Damage amount (positive).' },
+                  type: { type: 'string', description: 'Damage type, e.g. "cold", "fire".' },
+                },
+                required: ['value', 'type'],
+              },
+              description: 'Optional: typed damage entries to apply to each occupant.',
+            },
+            conditionId: {
+              type: 'string',
+              description: 'Optional: a condition to apply to each occupant (e.g. "poisoned").',
+            },
+            durationRounds: {
+              type: 'number',
+              description: 'Optional: duration in rounds for the applied condition, if any.',
+            },
+            trustedMode: {
+              type: 'boolean',
+              description:
+                'Set true only when the session header declares trusted mode. Lets a PC occupant auto-apply instead of returning needs_approval.',
+              default: false,
+            },
+          },
+          required: ['templateId'],
+        },
+      },
+      {
+        name: 'resolve-npc-save-ends',
+        description:
+          "Roll an NPC's pending save-ends save server-side (no dialog) and clear the condition automatically on success. NPC-only: a PC target is rejected outright regardless of trustedMode — Claude never rolls the PC's save (D2); the player rolls their own save-ends saves and Claude just reads the result. Use on the NPC's turn, per the condition's trigger (e.g. Hold Person rolls each turn; Sleep does not roll and wakes on damage/an ally's action instead — do not call this for triggers like that).",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tokenId: {
+              type: 'string',
+              description: 'The scene token ID of the NPC whose save is being rolled.',
+            },
+            conditionId: {
+              type: 'string',
+              description: 'The condition to clear if the save succeeds (e.g. "hold-person").',
+            },
+            ability: {
+              type: 'string',
+              description: 'The saving-throw ability abbreviation, e.g. "con", "wis".',
+            },
+            dc: {
+              type: 'number',
+              description: 'The save DC to beat.',
+            },
+          },
+          required: ['tokenId', 'conditionId', 'ability', 'dc'],
         },
       },
     ];
@@ -474,23 +578,43 @@ export class TokenManipulationTools {
     }
   }
 
+  // T34: NPC target applies immediately; PC target returns a needs_approval
+  // payload (D4) unless trustedMode is set (category 'consequence', same
+  // shape as apply-damage). Does NOT throw on needs_approval — that is a
+  // valid, defined outcome the DM must see and act on, not a tool failure.
   async handleToggleTokenCondition(args: any): Promise<any> {
     const schema = z.object({
       tokenId: z.string(),
       conditionId: z.string(),
       active: z.boolean().optional(),
+      durationRounds: z.number().optional(),
+      trustedMode: z.boolean().optional().default(false),
     });
 
-    const { tokenId, conditionId, active } = schema.parse(args);
+    const { tokenId, conditionId, active, durationRounds, trustedMode } = schema.parse(args);
 
-    this.logger.info('Toggling token condition', { tokenId, conditionId, active });
+    this.logger.info('Toggling token condition', {
+      tokenId,
+      conditionId,
+      active,
+      durationRounds,
+      trustedMode,
+    });
 
     try {
-      const result = await this.foundryClient.query('foundry-mcp-bridge.toggle-token-condition', {
-        tokenId,
-        conditionId,
-        active,
-      });
+      const result: any = await this.foundryClient.query(
+        'foundry-mcp-bridge.toggle-token-condition',
+        { tokenId, conditionId, active, durationRounds, trustedMode }
+      );
+
+      if (result && result.success === false && result.error === 'invalid_target') {
+        this.logger.warn('toggle-token-condition: invalid target', result);
+        throw new Error(`Cannot toggle condition: invalid target ${result.tokenId ?? tokenId}`);
+      }
+      if (result && result.status === 'needs_approval') {
+        this.logger.info('toggle-token-condition: PC target needs approval', result);
+        return result; // pass the D4 approval-request shape straight through
+      }
 
       this.logger.debug('Token condition toggled successfully', { tokenId, conditionId, result });
 
@@ -500,11 +624,142 @@ export class TokenManipulationTools {
         conditionId,
         isActive: result.isActive,
         conditionName: result.conditionName,
+        durationRounds: result.durationRounds ?? null,
       };
     } catch (error) {
       this.logger.error('Failed to toggle token condition', error);
       throw new Error(
         `Failed to toggle token condition: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  // T33: fire an NPC's attack/spell via the attack/save Activity
+  // (no dialog). NPC-only as the acting actor — a PC-actor gate rejection
+  // surfaces as a thrown error, never a silent success, regardless of
+  // trustedMode (there is no trustedMode param here: D2 is unconditional).
+  async handleUseNpcAbility(args: any): Promise<any> {
+    const schema = z.object({
+      tokenId: z.string(),
+      itemIdentifier: z.string(),
+      targetTokenIds: z.array(z.string()).optional(),
+    });
+
+    const { tokenId, itemIdentifier, targetTokenIds } = schema.parse(args);
+
+    this.logger.info('Using NPC ability', { tokenId, itemIdentifier, targetTokenIds });
+
+    try {
+      const result: any = await this.foundryClient.query('foundry-mcp-bridge.executeNpcAbility', {
+        tokenId,
+        itemIdentifier,
+        targetTokenIds,
+      });
+
+      if (result && result.success === false && result.error === 'invalid_target') {
+        this.logger.warn('use-npc-ability: invalid target', result);
+        throw new Error(`Cannot use ability: invalid target ${result.tokenId ?? tokenId}`);
+      }
+      if (result && result.success === false) {
+        this.logger.warn('use-npc-ability rejected by target-check', result);
+        throw new Error(
+          `Cannot use ability for token ${result.tokenId ?? tokenId}: ${result.error}`
+        );
+      }
+
+      this.logger.debug('NPC ability fired', { tokenId, itemIdentifier, result });
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to use NPC ability', error);
+      throw new Error(
+        `Failed to use NPC ability: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  // T35 (conditional, gate passed via live probe 2026-07-17): tick a
+  // persistent-AoE template's occupants. No single acting/target token for
+  // this call itself (category 'bookkeeping', SPEC §3.1) — each occupant is
+  // individually gated server-side and reported per-entry, so this handler
+  // does NOT throw on a per-occupant needs_approval/rejected — it passes the
+  // full occupants array straight through for the DM to act on.
+  async handleTickPersistentAoe(args: any): Promise<any> {
+    const schema = z.object({
+      templateId: z.string(),
+      damage: z.array(z.object({ value: z.number(), type: z.string() })).optional(),
+      conditionId: z.string().optional(),
+      durationRounds: z.number().optional(),
+      trustedMode: z.boolean().optional().default(false),
+    });
+
+    const { templateId, damage, conditionId, durationRounds, trustedMode } = schema.parse(args);
+
+    this.logger.info('Ticking persistent AoE template', {
+      templateId,
+      damage,
+      conditionId,
+      durationRounds,
+      trustedMode,
+    });
+
+    try {
+      const result: any = await this.foundryClient.query(
+        'foundry-mcp-bridge.tickPersistentAoeTemplate',
+        { templateId, damage, conditionId, durationRounds, trustedMode }
+      );
+
+      this.logger.debug('Persistent AoE tick resolved', {
+        templateId,
+        occupantCount: result?.occupants?.length,
+      });
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to tick persistent AoE template', error);
+      throw new Error(
+        `Failed to tick persistent AoE template: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  // T34: roll an NPC's save-ends save and clear the condition on success.
+  // NPC-only — a PC target is rejected outright (category 'action', D2:
+  // Claude never rolls the PC's save). Surfaces a gate rejection as an error
+  // rather than a silent success.
+  async handleResolveNpcSaveEnds(args: any): Promise<any> {
+    const schema = z.object({
+      tokenId: z.string(),
+      conditionId: z.string(),
+      ability: z.string(),
+      dc: z.number(),
+    });
+
+    const { tokenId, conditionId, ability, dc } = schema.parse(args);
+
+    this.logger.info('Resolving NPC save-ends condition', { tokenId, conditionId, ability, dc });
+
+    try {
+      const result: any = await this.foundryClient.query(
+        'foundry-mcp-bridge.resolveSaveEndsCondition',
+        { tokenId, conditionId, ability, dc }
+      );
+
+      if (result && result.success === false && result.error === 'invalid_target') {
+        this.logger.warn('resolve-npc-save-ends: invalid target', result);
+        throw new Error(`Cannot resolve save-ends: invalid target ${result.tokenId ?? tokenId}`);
+      }
+      if (result && result.success === false) {
+        this.logger.warn('resolve-npc-save-ends rejected by target-check', result);
+        throw new Error(
+          `Cannot resolve save-ends for token ${result.tokenId ?? tokenId}: ${result.error}`
+        );
+      }
+
+      this.logger.debug('NPC save-ends resolved', { tokenId, result });
+      return result;
+    } catch (error) {
+      this.logger.error('Failed to resolve NPC save-ends condition', error);
+      throw new Error(
+        `Failed to resolve NPC save-ends condition: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

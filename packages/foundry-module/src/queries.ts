@@ -113,6 +113,17 @@ export class QueryHandlers {
     // HP sync (T31)
     CONFIG.queries[`${modulePrefix}.applyDamage`] = this.handleApplyDamage.bind(this);
 
+    // NPC condition writes + save-ends resolution (T34)
+    CONFIG.queries[`${modulePrefix}.resolveSaveEndsCondition`] =
+      this.handleResolveSaveEndsCondition.bind(this);
+
+    // NPC ability/spell execution + PC-save handoff (T33)
+    CONFIG.queries[`${modulePrefix}.executeNpcAbility`] = this.handleExecuteNpcAbility.bind(this);
+
+    // Persistent-AoE occupancy tick (T35, conditional)
+    CONFIG.queries[`${modulePrefix}.tickPersistentAoeTemplate`] =
+      this.handleTickPersistentAoeTemplate.bind(this);
+
     // Turn bookkeeping (T-ADV)
     CONFIG.queries[`${modulePrefix}.advanceTurn`] = this.handleAdvanceTurn.bind(this);
 
@@ -1603,12 +1614,19 @@ export class QueryHandlers {
   }
 
   /**
-   * Handle toggle token condition request
+   * Handle toggle token condition request.
+   *
+   * T34 (SPEC §3/§5.6): gated same shape as apply_damage — category
+   * 'consequence'. NPC target → auto. PC target → D4 needs_approval unless
+   * trustedMode (the DM owns PC consequences; conditions landing on the PC
+   * are a consequence, not a D2 decision).
    */
   private async handleToggleTokenCondition(data: {
     tokenId: string;
     conditionId: string;
     active: boolean;
+    durationRounds?: number;
+    trustedMode?: boolean;
   }): Promise<any> {
     try {
       // SECURITY: Silent GM validation
@@ -1629,10 +1647,95 @@ export class QueryHandlers {
         throw new Error('active must be a boolean');
       }
 
-      return await this.dataAccess.toggleTokenCondition(data);
+      const resolveToken = makeLiveTokenResolver();
+      const verdict = checkTarget({
+        token_id: data.tokenId,
+        verb: 'apply_condition',
+        category: 'consequence',
+        trustedMode: data.trustedMode === true,
+        proposed: {
+          conditionId: data.conditionId,
+          active: data.active,
+          durationRounds: data.durationRounds,
+        },
+        resolveToken,
+      });
+
+      if (verdict.decision === 'invalid_target') {
+        return { success: false, error: 'invalid_target', tokenId: data.tokenId };
+      }
+      if (verdict.decision === 'needs_approval') {
+        return verdict.approval;
+      }
+      // 'rejected' cannot occur for category 'consequence'; 'auto' remains.
+
+      return await this.dataAccess.toggleTokenCondition({
+        tokenId: data.tokenId,
+        conditionId: data.conditionId,
+        active: data.active,
+        ...(data.durationRounds !== undefined ? { durationRounds: data.durationRounds } : {}),
+      });
     } catch (error) {
       throw new Error(
         `Failed to toggle token condition: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T34 — resolve an NPC's save-ends condition: roll the save server-side
+   * (no dialog) and clear the condition on success. NPC-only (category
+   * 'action'): a PC target is rejected outright regardless of trustedMode —
+   * Claude never rolls the PC's save (D2); the player rolls save-ends saves
+   * themselves and Claude just reads the result.
+   */
+  private async handleResolveSaveEndsCondition(data: {
+    tokenId: string;
+    conditionId: string;
+    ability: string;
+    dc: number;
+  }): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+
+      if (!data.tokenId) {
+        throw new Error('tokenId is required');
+      }
+      if (!data.conditionId) {
+        throw new Error('conditionId is required');
+      }
+      if (!data.ability) {
+        throw new Error('ability is required');
+      }
+      if (typeof data.dc !== 'number') {
+        throw new Error('dc is required and must be a number');
+      }
+
+      const resolveToken = makeLiveTokenResolver();
+      const verdict = checkTarget({
+        token_id: data.tokenId,
+        verb: 'resolve_save_ends',
+        category: 'action',
+        trustedMode: false,
+        resolveToken,
+      });
+
+      if (verdict.decision === 'invalid_target') {
+        return { success: false, error: 'invalid_target', tokenId: data.tokenId };
+      }
+      if (verdict.decision === 'rejected') {
+        return { success: false, error: verdict.error, tokenId: data.tokenId };
+      }
+      // 'needs_approval' cannot occur for category 'action'; 'auto' remains.
+
+      return await this.dataAccess.resolveSaveEndsCondition(data);
+    } catch (error) {
+      throw new Error(
+        `Failed to resolve save-ends condition: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }
@@ -1697,6 +1800,93 @@ export class QueryHandlers {
     } catch (error) {
       throw new Error(
         `Failed to use item: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T33 — fire an NPC's attack/spell through the attack/save Activity
+   * (`{configure:false}`, no GM dialog). Gated (SPEC §3, category 'action'):
+   * the ACTING token must be an NPC — a PC token as the actor is rejected
+   * outright, never overridden by trusted mode (D2: Claude never fires the
+   * PC's own items). A PC as a RECIPIENT is fine and handled inside
+   * `executeNpcAbility` itself (attack damage lands as a T31/T34 consequence
+   * follow-up call by the caller; a forced save is handed to the player).
+   */
+  private async handleExecuteNpcAbility(data: {
+    tokenId: string;
+    itemIdentifier: string;
+    targetTokenIds?: string[];
+  }): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+
+      if (!data.tokenId) {
+        throw new Error('tokenId is required');
+      }
+      if (!data.itemIdentifier) {
+        throw new Error('itemIdentifier is required');
+      }
+
+      const resolveToken = makeLiveTokenResolver();
+      const verdict = checkTarget({
+        token_id: data.tokenId,
+        verb: 'npc_use_ability',
+        category: 'action',
+        trustedMode: false,
+        resolveToken,
+      });
+
+      if (verdict.decision === 'invalid_target') {
+        return { success: false, error: 'invalid_target', tokenId: data.tokenId };
+      }
+      if (verdict.decision === 'rejected') {
+        return { success: false, error: verdict.error, tokenId: data.tokenId };
+      }
+      // 'needs_approval' cannot occur for category 'action'; 'auto' remains.
+
+      return await this.dataAccess.executeNpcAbility(data);
+    } catch (error) {
+      throw new Error(
+        `Failed to execute NPC ability: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T35 (conditional) — tick a persistent-AoE template's occupants. Pure
+   * NPC-side bookkeeping at the call level (SPEC §3.1, category
+   * 'bookkeeping': the template is the target, not a single token, so this
+   * call carries no target-check of its own — same as `advanceTurn`).
+   * Per-occupant gating (consequence category) happens inside
+   * `tickPersistentAoeTemplate` itself, once per token found in the zone.
+   */
+  private async handleTickPersistentAoeTemplate(data: {
+    templateId: string;
+    damage?: Array<{ value: number; type: string }>;
+    conditionId?: string;
+    durationRounds?: number;
+    trustedMode?: boolean;
+  }): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+
+      if (!data.templateId) {
+        throw new Error('templateId is required');
+      }
+
+      return await this.dataAccess.tickPersistentAoeTemplate(data);
+    } catch (error) {
+      throw new Error(
+        `Failed to tick persistent AoE template: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

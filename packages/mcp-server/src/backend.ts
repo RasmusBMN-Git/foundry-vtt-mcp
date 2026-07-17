@@ -1756,6 +1756,21 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'resolve-npc-save-ends':
+                  result = await tokenManipulationTools.handleResolveNpcSaveEnds(args);
+
+                  break;
+
+                case 'use-npc-ability':
+                  result = await tokenManipulationTools.handleUseNpcAbility(args);
+
+                  break;
+
+                case 'tick-persistent-aoe':
+                  result = await tokenManipulationTools.handleTickPersistentAoe(args);
+
+                  break;
+
                 // Map generation tools
 
                 case 'generate-map':
