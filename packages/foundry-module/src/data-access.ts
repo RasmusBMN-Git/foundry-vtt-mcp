@@ -7684,11 +7684,20 @@ export class FoundryDataAccess {
    * the chat-card "apply damage" button uses: it runs dnd5e's resistance /
    * vulnerability / immunity math and respects temp HP natively (V1 B1, SPEC
    * §5.1). Using `token.actor` (rather than looking the actor up by name) keeps
-   * identical unlinked NPCs independent. Heal via `multiplier: -1`.
+   * identical unlinked NPCs independent. Heal by passing a `type:"healing"`
+   * damage entry (T-INT-confirmed) with the default multiplier — a negative
+   * multiplier double-negates into damage instead, so it's rejected below.
    *
    * Gating happens in the query handler (SPEC §3: category 'consequence'),
    * before this method is ever called — this method assumes the target-check
    * already passed.
+   *
+   * T31-FIX (reopened from T-INT NO-GO 2026-07-18, finding #1): if the target
+   * drops to 0 HP or below AND is an NPC (never a PC — a PC at 0 HP is
+   * unconscious / rolling death saves, not defeated) AND has a combatant in
+   * the active combat, flag that combatant defeated + apply the dead overlay.
+   * Lets native skip-defeated (T-ADV) work hands-off without the DM marking
+   * it manually.
    */
   async applyDamageToToken(data: {
     tokenId: string;
@@ -7696,6 +7705,13 @@ export class FoundryDataAccess {
     multiplier?: number;
   }): Promise<any> {
     this.validateFoundryState();
+
+    if ((data.multiplier ?? 1) < 0) {
+      throw new Error(
+        'multiplier must not be negative — a negative multiplier double-negates into damage. ' +
+          'To heal, pass a damage entry with type:"healing" and the default multiplier.'
+      );
+    }
 
     try {
       const scene = (game.scenes as any).current;
@@ -7716,6 +7732,22 @@ export class FoundryDataAccess {
       await actor.applyDamage(data.damage, { multiplier: data.multiplier ?? 1 });
       const after = actor.system?.attributes?.hp?.value ?? null;
 
+      let defeatedFlagged = false;
+      if (after !== null && after <= 0 && actor.type === 'npc') {
+        const combat = (game as any).combat;
+        const combatant = combat?.combatants?.find((c: any) => c.tokenId === data.tokenId);
+        if (combatant) {
+          await combatant.update({ defeated: true });
+          if (typeof actor.toggleStatusEffect === 'function') {
+            await actor.toggleStatusEffect((CONFIG as any).specialStatusEffects.DEFEATED, {
+              active: true,
+              overlay: true,
+            });
+          }
+          defeatedFlagged = true;
+        }
+      }
+
       this.auditLog(
         'applyDamageToToken',
         { tokenId: data.tokenId, damage: data.damage, multiplier: data.multiplier },
@@ -7731,6 +7763,7 @@ export class FoundryDataAccess {
         delta: before !== null && after !== null ? before - after : null,
         damage: data.damage,
         multiplier: data.multiplier ?? 1,
+        defeatedFlagged,
       };
     } catch (error) {
       this.auditLog(

@@ -224,7 +224,7 @@ export class TokenManipulationTools {
       {
         name: 'apply-damage',
         description:
-          "Apply typed damage (or healing, via a negative multiplier) to a token's HP. Runs the target's native resistance/vulnerability/immunity and temp-HP math (the same path the chat-card 'apply damage' button uses) — never a raw HP write. Targeting an NPC/monster applies immediately. Targeting the PC returns a needs_approval response (D4) unless trustedMode is set, in which case it applies automatically (the DM owns PC consequences; PC decisions like movement and rolls are never auto-applied). Damage must be passed explicitly as typed entries — this tool never parses a chat card.",
+          "Apply typed damage (or healing, via a damage entry with type:\"healing\") to a token's HP. Runs the target's native resistance/vulnerability/immunity and temp-HP math (the same path the chat-card 'apply damage' button uses) — never a raw HP write. Targeting an NPC/monster applies immediately. Targeting the PC returns a needs_approval response (D4) unless trustedMode is set, in which case it applies automatically (the DM owns PC consequences; PC decisions like movement and rolls are never auto-applied). Damage must be passed explicitly as typed entries — this tool never parses a chat card. Dropping an NPC to 0 HP auto-flags its combatant defeated (defeatedFlagged:true) if it's in the active combat; PCs are never auto-flagged.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -250,7 +250,7 @@ export class TokenManipulationTools {
             multiplier: {
               type: 'number',
               description:
-                'Damage multiplier. 1 = normal damage (default). -1 = heal the same amount.',
+                'Damage multiplier, must be >= 0 (default 1). To heal, pass a damage entry with type:"healing" instead — a negative multiplier is rejected, since it would double-negate healing entries into damage.',
               default: 1,
             },
             trustedMode: {
