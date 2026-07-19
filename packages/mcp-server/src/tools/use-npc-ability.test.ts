@@ -55,6 +55,7 @@ describe('use-npc-ability — NPC actor (auto)', () => {
       tokenId: 'npc1',
       itemIdentifier: 'Scimitar',
       targetTokenIds: ['pc1'],
+      trustedMode: false,
     });
     expect(result.success).toBe(true);
     expect(result.activityType).toBe('attack');
@@ -83,7 +84,7 @@ describe('use-npc-ability — NPC actor (auto)', () => {
 
 describe('use-npc-ability — PC actor (barred, D2)', () => {
   it('throws on a gate rejection instead of silently succeeding', async () => {
-    const { tools, query } = makeTools(async () => ({
+    const { tools } = makeTools(async () => ({
       success: false,
       error: 'pc_actor_barred',
       tokenId: 'pc1',
@@ -92,11 +93,29 @@ describe('use-npc-ability — PC actor (barred, D2)', () => {
     await expect(
       tools.handleUseNpcAbility({ tokenId: 'pc1', itemIdentifier: 'Longsword' })
     ).rejects.toThrow(/pc_actor_barred/);
+  });
 
-    // No trustedMode param exists on this tool at all — D2 is unconditional.
+  it('bars a PC actor even with trustedMode true — D2 is unconditional', async () => {
+    // trustedMode governs only auto-damage on a PC *target* (consequence); it
+    // never unlocks a PC as the acting actor. The server-side gate still
+    // rejects and the tool surfaces it as a thrown error.
+    const { tools, query } = makeTools(async () => ({
+      success: false,
+      error: 'pc_actor_barred',
+      tokenId: 'pc1',
+    }));
+
+    await expect(
+      tools.handleUseNpcAbility({
+        tokenId: 'pc1',
+        itemIdentifier: 'Longsword',
+        trustedMode: true,
+      })
+    ).rejects.toThrow(/pc_actor_barred/);
+
     expect(query).toHaveBeenCalledWith(
       'foundry-mcp-bridge.executeNpcAbility',
-      expect.not.objectContaining({ trustedMode: expect.anything() })
+      expect.objectContaining({ trustedMode: true })
     );
   });
 });

@@ -275,7 +275,7 @@ export class TokenManipulationTools {
       {
         name: 'use-npc-ability',
         description:
-          "Fire an NPC's attack or spell through its attack/save Activity (no GM dialog) — rolls to chat and spends the slot automatically. This is NOT use-item: use-item forces a configuration dialog and returns requiresGMInteraction, this tool does not. NPC-only as the actor: a PC token as the acting actor is rejected outright regardless of trustedMode (D2 — Claude never fires the PC's own items). Damage/conditions landing on a target are NOT applied by this tool — read the chat result and follow up with apply-damage / toggle-token-condition under their own gate. If the fired ability is a save (not an attack) and a target is the PC, this tool automatically posts a roll request to the player via request-player-rolls instead of rolling the PC's save itself (D2) — the response's pcSaveRequested field reports this.",
+          "Fire an NPC's attack or spell through its attack/save Activity (no GM dialog). For an ATTACK, this fast-forwards the d20 attack roll AND, on a hit (attack total vs each target's AC; a natural 20 always hits + crits, a natural 1 always misses), auto-rolls damage and applies it to that target through the same gate as apply-damage: an NPC target takes it automatically, a PC target returns needs_approval (D4) unless trustedMode — a miss applies nothing. The per-target outcome is in the response's `results` array (hit/crit, damage, decision). This is NOT use-item: use-item forces a configuration dialog and returns requiresGMInteraction, this tool does not. NPC-only as the actor: a PC token as the acting actor is rejected outright regardless of trustedMode (D2 — Claude never fires the PC's own items). Conditions and save effects are still NOT auto-applied — follow up with toggle-token-condition under its own gate. If the fired ability is a SAVE (not an attack) and a target is the PC, this tool automatically posts a roll request to the player via request-player-rolls instead of rolling the PC's save itself (D2) — the response's pcSaveRequested field reports this.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -292,6 +292,12 @@ export class TokenManipulationTools {
               items: { type: 'string' },
               description:
                 'Optional: scene token IDs to target (sets canvas targets before firing, the v14 canvas.tokens.setTargets path).',
+            },
+            trustedMode: {
+              type: 'boolean',
+              description:
+                'Set true only when the session header declares trusted mode. Lets auto-damage on a PC target apply automatically instead of returning needs_approval. Never affects the acting-token gate — a PC actor is always barred (D2).',
+              default: false,
             },
           },
           required: ['tokenId', 'itemIdentifier'],
@@ -634,26 +640,30 @@ export class TokenManipulationTools {
     }
   }
 
-  // T33: fire an NPC's attack/spell via the attack/save Activity
-  // (no dialog). NPC-only as the acting actor — a PC-actor gate rejection
-  // surfaces as a thrown error, never a silent success, regardless of
-  // trustedMode (there is no trustedMode param here: D2 is unconditional).
+  // T33 (+ T33-FIX): fire an NPC's attack/spell via the attack/save Activity
+  // (no dialog); an attack auto-rolls + applies damage on hit through the gate.
+  // NPC-only as the acting actor — a PC-actor gate rejection surfaces as a
+  // thrown error, never a silent success. `trustedMode` governs ONLY auto-damage
+  // on a PC target (consequence); the acting-token gate is unconditional (D2:
+  // a PC actor is always barred, trusted or not).
   async handleUseNpcAbility(args: any): Promise<any> {
     const schema = z.object({
       tokenId: z.string(),
       itemIdentifier: z.string(),
       targetTokenIds: z.array(z.string()).optional(),
+      trustedMode: z.boolean().optional().default(false),
     });
 
-    const { tokenId, itemIdentifier, targetTokenIds } = schema.parse(args);
+    const { tokenId, itemIdentifier, targetTokenIds, trustedMode } = schema.parse(args);
 
-    this.logger.info('Using NPC ability', { tokenId, itemIdentifier, targetTokenIds });
+    this.logger.info('Using NPC ability', { tokenId, itemIdentifier, targetTokenIds, trustedMode });
 
     try {
       const result: any = await this.foundryClient.query('foundry-mcp-bridge.executeNpcAbility', {
         tokenId,
         itemIdentifier,
         targetTokenIds,
+        trustedMode,
       });
 
       if (result && result.success === false && result.error === 'invalid_target') {

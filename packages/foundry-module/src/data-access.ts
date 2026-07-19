@@ -7433,11 +7433,22 @@ export class FoundryDataAccess {
         { mode: (globalThis as any).CONST?.GRID_SNAPPING_MODES?.CENTER ?? 1 }
       );
 
-      // Update token position (snapped, not the raw requested point)
+      // getSnappedPoint returns the cell CENTER, but token.update writes the
+      // token's top-left corner — offset by half the token's footprint (in
+      // grid cells) so the token is centered in its cell(s) instead of
+      // straddling the intersection (T32-FIX; still native snapping, only
+      // the size term is added — no hand-rolled grid geometry).
+      const gridSize = (scene as any).grid?.size ?? 100;
+      const topLeft = {
+        x: snapped.x - ((token.width ?? 1) * gridSize) / 2,
+        y: snapped.y - ((token.height ?? 1) * gridSize) / 2,
+      };
+
+      // Update token position (snapped + centered, not the raw requested point)
       await token.update(
         {
-          x: snapped.x,
-          y: snapped.y,
+          x: topLeft.x,
+          y: topLeft.y,
         },
         { animate: data.animate !== false }
       );
@@ -7449,7 +7460,7 @@ export class FoundryDataAccess {
         tokenId: token.id,
         tokenName: token.name,
         previousPosition,
-        newPosition: { x: snapped.x, y: snapped.y },
+        newPosition: { x: topLeft.x, y: topLeft.y },
         requestedPosition: { x: data.x, y: data.y },
         animated: data.animate !== false,
       };
