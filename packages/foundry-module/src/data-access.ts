@@ -8452,11 +8452,24 @@ export class FoundryDataAccess {
   }
 
   /**
-   * T33 — fire an NPC's attack/spell through the Activity API with
-   * `configure:false` (SPEC §5.2), NOT `useItem` (which forces
-   * `configureDialog:true` and returns `requiresGMInteraction:true`, V1 A6).
-   * Native dnd5e rolls the attack/damage to chat with no GM dialog, spends
-   * the slot, drops any area template.
+   * T33 (+ T33-FIX) — fire an NPC's attack/spell, fast-forwarding every dialog.
+   *
+   * Attack activities fire `attackActivity.rollAttack({}, {configure:false},
+   * {create:true})` — NOT `.use()`. Native dnd5e (no Midi) `.use()` only posts
+   * a card with MANUAL attack/damage buttons AND still pops the d20 attack-roll
+   * dialog (`{configure:false}` on `.use()` sits on the *usage* dialog, not the
+   * attack-roll dialog — the T-INT NO-GO 2026-07-18 finding). `rollAttack` with
+   * `{configure:false}` on the dialog config resolves the d20 to chat with no
+   * dialog. On a hit (attack total ≥ the target's AC; a natural 20 always hits +
+   * crits, a natural 1 always misses) it rolls damage
+   * (`rollDamage({critical}, {configure:false}, {create:true})`) and applies it
+   * through the existing T31 `applyDamageToToken` path — the target-check gate
+   * runs per target here (category 'consequence'), so a PC target is D4-gated /
+   * trusted-auto, never a raw bypass. A miss applies nothing.
+   *
+   * Save activities (no attack roll) keep the T33 path: post the card via
+   * `.use({configure:false})`; a PC target's save is handed to the player via
+   * `requestPlayerRolls` (D2), never rolled here.
    *
    * Targeting uses `canvas.tokens.setTargets` (SPEC §5.3, the v14 replacement
    * for the removed `game.user.updateTokenTargets`).
@@ -8482,6 +8495,10 @@ export class FoundryDataAccess {
     tokenId: string;
     itemIdentifier: string;
     targetTokenIds?: string[];
+    // Session-header posture (D4 addendum). Governs ONLY auto-damage on a PC
+    // target (category 'consequence'): trusted → auto, else D4 needs_approval.
+    // It never affects the acting-token gate (D2, always barred for a PC actor).
+    trustedMode?: boolean;
   }): Promise<any> {
     this.validateFoundryState();
 
@@ -8523,18 +8540,161 @@ export class FoundryDataAccess {
       const activities = (item as any).system?.activities;
       const attackActivity = activities?.getByType?.('attack')?.[0];
       const saveActivity = activities?.getByType?.('save')?.[0];
-      const activity = attackActivity ?? saveActivity;
 
-      if (!activity || typeof activity.use !== 'function') {
+      if (!attackActivity && !saveActivity) {
         throw new Error(
           `Item "${item.name}" has no attack/save Activity to fire (T30a: use-item is not the NPC-ability path)`
         );
       }
 
-      // Save-forcing spell with no attack roll: hand PC targets off to the
-      // player (D2) rather than resolving the save here.
+      // ── ATTACK PATH (T33-FIX): fast-forward the d20, auto-damage on hit ──
+      if (attackActivity) {
+        if (typeof attackActivity.rollAttack !== 'function') {
+          throw new Error(
+            `Attack activity on "${item.name}" has no rollAttack (dnd5e version mismatch)`
+          );
+        }
+
+        // `{configure:false}` on the DIALOG config fast-forwards the attack-roll
+        // dialog; the resolved d20 posts to chat with no dialog.
+        const attackRolls = await attackActivity.rollAttack(
+          {},
+          { configure: false },
+          { create: true }
+        );
+        const attackRoll = Array.isArray(attackRolls) ? attackRolls[0] : attackRolls;
+        const attackTotal: number | null =
+          typeof attackRoll?.total === 'number' ? attackRoll.total : null;
+        // dnd5e D20Roll getters honour any adjusted crit range: a natural 20
+        // always hits + crits; a natural 1 always misses.
+        const isCrit = attackRoll?.isCritical === true;
+        const isFumble = attackRoll?.isFumble === true;
+
+        const resolveToken = makeLiveTokenResolver();
+        const targetIds = data.targetTokenIds ?? [];
+        const results: any[] = [];
+
+        for (const tid of targetIds) {
+          const targetToken = scene.tokens.get(tid);
+          const targetActor = (targetToken as any)?.actor;
+          const ac = targetActor?.system?.attributes?.ac?.value ?? null;
+          const hit =
+            isCrit || (!isFumble && attackTotal !== null && ac !== null && attackTotal >= ac);
+
+          const base: any = {
+            tokenId: tid,
+            tokenName: (targetToken as any)?.name ?? tid,
+            ac,
+            attackTotal,
+          };
+
+          if (!hit) {
+            results.push({ ...base, hit: false, crit: false });
+            continue;
+          }
+
+          // Roll damage (crit flag from the natural 20), no dialog.
+          const damageRolls = await attackActivity.rollDamage(
+            { critical: isCrit },
+            { configure: false },
+            { create: true }
+          );
+          const rollsArr = Array.isArray(damageRolls)
+            ? damageRolls
+            : damageRolls
+              ? [damageRolls]
+              : [];
+          const damageEntries = rollsArr
+            .map((r: any) => ({
+              value: typeof r?.total === 'number' ? r.total : 0,
+              type: r?.options?.type ?? r?.type ?? 'untyped',
+            }))
+            .filter((d: any) => d.value > 0);
+          const totalDamage = damageEntries.reduce((s: number, d: any) => s + d.value, 0);
+
+          const hitBase = {
+            ...base,
+            hit: true,
+            crit: isCrit,
+            damage: totalDamage,
+            damageParts: damageEntries,
+          };
+
+          if (damageEntries.length === 0) {
+            results.push({ ...hitBase, decision: 'no_damage' });
+            continue;
+          }
+
+          // Route damage through the T31 gate (category 'consequence'): NPC
+          // auto; PC → D4 approval unless trusted mode. Never a raw bypass.
+          const verdict = checkTarget({
+            token_id: tid,
+            verb: 'npc_attack_damage',
+            category: 'consequence',
+            trustedMode: data.trustedMode === true,
+            proposed: { damage: damageEntries },
+            resolveToken,
+          });
+
+          if (verdict.decision === 'invalid_target') {
+            results.push({ ...hitBase, decision: 'invalid_target' });
+            continue;
+          }
+          if (verdict.decision === 'needs_approval') {
+            // No write until the player approves (D4) — same as every
+            // consequence verb; the DM re-issues apply-damage out of band.
+            results.push({ ...hitBase, decision: 'needs_approval', approval: verdict.approval });
+            continue;
+          }
+
+          const dmgResult = await this.applyDamageToToken({
+            tokenId: tid,
+            damage: damageEntries,
+          });
+          results.push({
+            ...hitBase,
+            decision: 'auto',
+            hpBefore: dmgResult.hpBefore,
+            hpAfter: dmgResult.hpAfter,
+          });
+        }
+
+        this.auditLog(
+          'executeNpcAbility',
+          {
+            tokenId: data.tokenId,
+            itemId: item.id,
+            itemName: item.name,
+            targetTokenIds: data.targetTokenIds,
+          },
+          'success'
+        );
+
+        return {
+          success: true,
+          tokenId: token.id,
+          tokenName: token.name,
+          itemName: item.name,
+          activityType: 'attack',
+          attackTotal,
+          crit: isCrit,
+          fumble: isFumble,
+          targets: targetIds,
+          results,
+          pcSaveRequested: null,
+          chatMessageCreated: attackTotal !== null,
+        };
+      }
+
+      // ── SAVE PATH (T33, unchanged): PC save handoff (D2) then post card ──
+      if (typeof (saveActivity as any).use !== 'function') {
+        throw new Error(
+          `Save activity on "${item.name}" has no use() (T30a: use-item is not the NPC-ability path)`
+        );
+      }
+
       let pcSaveRequested: { targetName: string; ability: string } | null = null;
-      if (saveActivity && !attackActivity && data.targetTokenIds?.length) {
+      if (data.targetTokenIds?.length) {
         const resolveToken = makeLiveTokenResolver();
         const abilityRaw = (saveActivity as any).save?.ability;
         const ability = Array.isArray(abilityRaw) ? abilityRaw[0] : (abilityRaw ?? 'con');
@@ -8554,7 +8714,11 @@ export class FoundryDataAccess {
         }
       }
 
-      const chatResult = await activity.use({}, { configure: false }, { create: true });
+      const chatResult = await (saveActivity as any).use(
+        {},
+        { configure: false },
+        { create: true }
+      );
 
       this.auditLog(
         'executeNpcAbility',
@@ -8572,7 +8736,7 @@ export class FoundryDataAccess {
         tokenId: token.id,
         tokenName: token.name,
         itemName: item.name,
-        activityType: attackActivity ? 'attack' : 'save',
+        activityType: 'save',
         targets: data.targetTokenIds ?? [],
         pcSaveRequested,
         chatMessageCreated: !!chatResult,
