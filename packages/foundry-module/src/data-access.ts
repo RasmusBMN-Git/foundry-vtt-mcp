@@ -240,6 +240,42 @@ interface WorldUser {
   isGM: boolean;
 }
 
+// T-CHATREAD: normalized chat-message record. Field paths pinned from live
+// dnd5e 5.3.3 cards (STEP 1) — every number comes from `rolls[].total` /
+// `flags.dnd5e`, never rendered HTML. `classification` is the coarse
+// attack/damage/save/other bucket the DM cares about; `dnd5eRollType` carries
+// the raw system roll type verbatim (e.g. 'healing') so nothing is lost.
+interface ChatRollRecord {
+  total: number | null;
+  formula: string | null;
+  damageType: string | null; // DamageRoll options.type (e.g. 'slashing')
+  class: string | null; // 'D20Roll' | 'DamageRoll' | 'Roll'
+}
+
+interface ChatMessageTargetRecord {
+  name: string | null;
+  uuid: string | null;
+  tokenId: string | null;
+  actorId: string | null;
+  ac: number | null;
+}
+
+interface ChatMessageRecord {
+  id: string | null;
+  timestamp: number | null;
+  classification: 'attack' | 'damage' | 'save' | 'other';
+  dnd5eRollType: string | null; // raw flags.dnd5e.roll.type ('healing' etc.)
+  flavor: string | null;
+  speaker: { actor: string | null; token: string | null; alias: string | null };
+  rollTotal: number | null; // sum across rolls (convenience)
+  rolls: ChatRollRecord[];
+  item: { id: string | null; uuid: string | null; type: string | null } | null;
+  targets: ChatMessageTargetRecord[];
+  ability: string | null; // save ability (con/wis/…) where present
+  blind: boolean;
+  whisperedToGM: boolean; // whisper array non-empty — caller respects D8 in narration
+}
+
 // Phase 2: Write Operation Interfaces
 interface ActorCreationRequest {
   creatureType: string;
@@ -3788,6 +3824,107 @@ export class FoundryDataAccess {
         active: user.active,
         isGM: user.isGM,
       })),
+    };
+  }
+
+  /**
+   * T-CHATREAD: read the last N chat messages (default 10, cap 30) and normalize
+   * each to a compact record, so the DM can pull what the player just rolled after
+   * `wait-for-turn` returns instead of asking them to read the number aloud.
+   *
+   * READ-ONLY. No write path, no permission logic (D2/D4/trusted/target-check all
+   * untouched). GM scoping is enforced by the queries.ts handler's validateGMAccess();
+   * this method only reads `game.messages` and shapes the output. Field paths were
+   * pinned from live dnd5e 5.3.3 cards (T-CHATREAD STEP 1) — no rendered-HTML parsing.
+   * Messages are returned oldest-to-newest (the last entry is the most recent).
+   */
+  async getRecentChatMessages(opts?: {
+    limit?: number;
+  }): Promise<{ messages: ChatMessageRecord[] }> {
+    this.validateFoundryState();
+
+    const requested =
+      typeof opts?.limit === 'number' && Number.isFinite(opts.limit) ? Math.floor(opts.limit) : 10;
+    const limit = Math.min(30, Math.max(1, requested));
+
+    const all: any[] = (game.messages?.contents as any[]) ?? [];
+    const recent = all.slice(-limit);
+
+    return { messages: recent.map(m => this.normalizeChatMessage(m)) };
+  }
+
+  /**
+   * T-CHATREAD helper: map one Foundry chat message to a ChatMessageRecord.
+   * Classification prefers `flags.dnd5e.roll.type`; for flag-less rolls (e.g. the
+   * `request-player-rolls` button emits a plain Roll with a descriptive flavor) it
+   * falls back to the `flavor` document field (not rendered HTML). Any message that
+   * is neither a native attack/damage/save nor a flavor-matched roll → 'other'.
+   */
+  private normalizeChatMessage(m: any): ChatMessageRecord {
+    const d5e = m?.flags?.dnd5e ?? null;
+    const d5eRollType: string | null = d5e?.roll?.type ?? null;
+    const rolls: any[] = Array.isArray(m?.rolls) ? m.rolls : [];
+    const isRoll = rolls.length > 0;
+
+    let classification: 'attack' | 'damage' | 'save' | 'other' = 'other';
+    if (d5eRollType === 'attack' || d5eRollType === 'damage' || d5eRollType === 'save') {
+      classification = d5eRollType;
+    } else if (!d5eRollType && isRoll) {
+      const f = String(m?.flavor ?? '').toLowerCase();
+      if (/saving throw/.test(f)) classification = 'save';
+      else if (/attack/.test(f)) classification = 'attack';
+      else if (/damage/.test(f)) classification = 'damage';
+    }
+
+    const rollRecords: ChatRollRecord[] = rolls.map(r => ({
+      total: typeof r?.total === 'number' ? r.total : null,
+      formula: typeof r?.formula === 'string' ? r.formula : null,
+      damageType: r?.options?.type ?? null,
+      class: r?.constructor?.name ?? null,
+    }));
+    const numericTotals = rollRecords
+      .map(r => r.total)
+      .filter((t): t is number => typeof t === 'number');
+    const rollTotal = numericTotals.length ? numericTotals.reduce((a, b) => a + b, 0) : null;
+
+    const targetsRaw: any[] = Array.isArray(d5e?.targets) ? d5e.targets : [];
+    const targets: ChatMessageTargetRecord[] = targetsRaw.map(t => {
+      const uuid: string | null = t?.uuid ?? null;
+      return {
+        name: t?.name ?? null,
+        uuid,
+        tokenId: uuid ? (uuid.match(/Token\.([^.]+)/)?.[1] ?? null) : null,
+        actorId: uuid ? (uuid.match(/Actor\.([^.]+)/)?.[1] ?? null) : null,
+        ac: typeof t?.ac === 'number' ? t.ac : null,
+      };
+    });
+
+    const item = d5e?.item
+      ? {
+          id: d5e.item.id ?? null,
+          uuid: d5e.item.uuid ?? null,
+          type: d5e.item.type ?? null,
+        }
+      : null;
+
+    return {
+      id: m?.id ?? null,
+      timestamp: typeof m?.timestamp === 'number' ? m.timestamp : null,
+      classification,
+      dnd5eRollType: d5eRollType,
+      flavor: m?.flavor ?? null,
+      speaker: {
+        actor: m?.speaker?.actor ?? null,
+        token: m?.speaker?.token ?? null,
+        alias: m?.speaker?.alias ?? null,
+      },
+      rollTotal,
+      rolls: rollRecords,
+      item,
+      targets,
+      ability: d5e?.roll?.ability ?? null,
+      blind: !!m?.blind,
+      whisperedToGM: Array.isArray(m?.whisper) && m.whisper.length > 0,
     };
   }
 

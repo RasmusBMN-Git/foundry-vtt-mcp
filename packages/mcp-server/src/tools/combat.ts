@@ -68,6 +68,24 @@ export class CombatTools {
           },
         },
       },
+      {
+        name: 'get-recent-chat-messages',
+        description:
+          "Read the most recent Foundry chat messages (default 10, max 30), normalized so you can see what the player just rolled. Call it right after wait-for-turn returns to pull the player's attack/damage/save totals instead of asking them to read the number aloud. Each record gives: classification ('attack' | 'damage' | 'save' | 'other'), dnd5eRollType (raw system type, e.g. 'healing'), rollTotal + per-roll totals/formula/damageType, flavor, speaker, item, and target token/actor where the card carries it. READ-ONLY: it changes no state and applies nothing — to apply a number the player rolled, make the normal (gated) apply-damage call. Messages come back oldest-to-newest (the last entry is the most recent). Any message that can't be parsed cleanly is classified 'other'; fall back to asking the player for the number in that case.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'integer',
+              description:
+                'How many of the most recent messages to return. Default 10; capped at 30.',
+              default: 10,
+              minimum: 1,
+              maximum: 30,
+            },
+          },
+        },
+      },
     ];
   }
 
@@ -119,5 +137,23 @@ export class CombatTools {
         return result;
       }
     }
+  }
+
+  /**
+   * T-CHATREAD: pull the recent chat log so the DM can read the player's
+   * just-rolled attack/damage/save totals after wait-for-turn. Read-only — it
+   * forwards to the module's GM-scoped getRecentChatMessages query and returns the
+   * normalized records. No write path, no permission logic.
+   */
+  async handleGetRecentChatMessages(args: any): Promise<any> {
+    const schema = z.object({
+      limit: z.number().int().min(1).max(30).default(10),
+    });
+
+    const { limit } = schema.parse(args ?? {});
+
+    return await this.foundryClient.query('foundry-mcp-bridge.getRecentChatMessages', {
+      limit,
+    });
   }
 }

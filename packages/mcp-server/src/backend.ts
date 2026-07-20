@@ -1680,6 +1680,13 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                // Chat read tool (get-recent-chat-messages) — T-CHATREAD
+
+                case 'get-recent-chat-messages':
+                  result = await combatTools.handleGetRecentChatMessages(args);
+
+                  break;
+
                 // Campaign management tools
 
                 case 'create-campaign-dashboard':
