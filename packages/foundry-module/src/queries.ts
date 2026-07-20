@@ -187,6 +187,10 @@ export class QueryHandlers {
     // Combat turn wait (T25) — install the hook and register the blocking query.
     this.combatWatcher.register();
     CONFIG.queries[`${modulePrefix}.waitForTurn`] = this.handleWaitForTurn.bind(this);
+
+    // Chat read (T-CHATREAD) — read-only pull of the recent chat log.
+    CONFIG.queries[`${modulePrefix}.getRecentChatMessages`] =
+      this.handleGetRecentChatMessages.bind(this);
   }
 
   /**
@@ -443,6 +447,31 @@ export class QueryHandlers {
     }
 
     return await this.combatWatcher.waitForTurn(data);
+  }
+
+  /**
+   * T-CHATREAD: read the recent chat log (GM-scoped) so the DM can pull the
+   * player's just-rolled attack/damage/save totals after wait-for-turn. Read-only —
+   * changes no state, applies nothing, touches no permission logic.
+   */
+  private async handleGetRecentChatMessages(data?: { limit?: number }): Promise<any> {
+    try {
+      // SECURITY: Silent GM validation (bridge connects as GM). Non-GM callers get
+      // a benign denial rather than chat state.
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+
+      this.dataAccess.validateFoundryState();
+      return await this.dataAccess.getRecentChatMessages(data);
+    } catch (error) {
+      throw new Error(
+        `Failed to get recent chat messages: ${
+          error instanceof Error ? error.message : 'Unknown error'
+        }`
+      );
+    }
   }
 
   /**
