@@ -8633,8 +8633,16 @@ export class FoundryDataAccess {
           }
 
           // Roll damage (crit flag from the natural 20), no dialog.
+          // T-BUG-multiplyNumeric (2026-07-20): dnd5e 5.x's damage process-config
+          // key is `isCritical` (boolean), NOT `critical`. A boolean under `critical`
+          // survives `DamageRoll.build`'s `config.critical ??= {}` guard and then
+          // `config.critical.multiplyNumeric = …` throws
+          // "Cannot create property 'multiplyNumeric' on boolean 'false'|'true'" on
+          // every hit. `isCritical` drives crit doubling correctly and leaves
+          // `config.critical` undefined so build() creates the {}. Matches dnd5e's
+          // own AttackActivity.#rollDamage handler.
           const damageRolls = await attackActivity.rollDamage(
-            { critical: isCrit },
+            { isCritical: isCrit },
             { configure: false },
             { create: true }
           );

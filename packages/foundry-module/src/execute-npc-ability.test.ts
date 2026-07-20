@@ -171,8 +171,13 @@ describe('executeNpcAbility — attack path fast-forward (T33-FIX)', () => {
       targetTokenIds: ['npc2'],
     });
 
+    // T-BUG-multiplyNumeric (2026-07-20): the process-config key MUST be
+    // `isCritical`, not `critical`. A boolean `critical` crashes dnd5e 5.x's
+    // real DamageRoll.build ("Cannot create property 'multiplyNumeric' on
+    // boolean …") on every hit; the mocked rollDamage here can't see that, so
+    // this assertion is the regression guard that pins the correct key.
     expect(activity.rollDamage).toHaveBeenCalledWith(
-      { critical: false },
+      { isCritical: false },
       { configure: false },
       { create: true }
     );
@@ -205,7 +210,7 @@ describe('executeNpcAbility — attack path fast-forward (T33-FIX)', () => {
     expect(res.results[0].hit).toBe(false);
   });
 
-  it('a natural 20 always hits and crits (damage rolled with critical:true) even below AC', async () => {
+  it('a natural 20 always hits and crits (damage rolled with isCritical:true) even below AC', async () => {
     const activity = makeAttackActivity({ attackTotal: 5, isCritical: true });
     installFoundry({
       npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity) }),
@@ -222,7 +227,7 @@ describe('executeNpcAbility — attack path fast-forward (T33-FIX)', () => {
     expect(res.results[0].hit).toBe(true);
     expect(res.results[0].crit).toBe(true);
     expect(activity.rollDamage).toHaveBeenCalledWith(
-      { critical: true },
+      { isCritical: true },
       { configure: false },
       { create: true }
     );
