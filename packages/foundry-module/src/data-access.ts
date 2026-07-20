@@ -5813,9 +5813,15 @@ export class FoundryDataAccess {
           break;
 
         case 'save':
-          // Use saving throw modifier from roll data
+          // Use saving throw modifier from roll data.
+          // dnd5e 5.x: abilities[x].save is a RollConfigField object, not a number —
+          // the numeric save modifier lives at .save.value (set in prepareAbilities).
+          // Interpolating the object directly produced "1d20+[object Object]", which
+          // Foundry's roll parser rejected with a SyntaxError on "[".
           const saveMod =
-            rollData.abilities?.[rollTarget]?.save ?? rollData.abilities?.[rollTarget]?.mod ?? 0;
+            rollData.abilities?.[rollTarget]?.save?.value ??
+            rollData.abilities?.[rollTarget]?.mod ??
+            0;
           baseFormula = `1d20+${saveMod}`;
           break;
 
