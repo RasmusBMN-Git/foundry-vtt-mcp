@@ -90,6 +90,37 @@ export class SceneTools {
           required: ['src'],
         },
       },
+      {
+        name: 'configure-scene-vision-lighting',
+        description:
+          "Configure a scene's vision and lighting without opening Scene Configuration by hand. Toggle global illumination (lights the whole map), toggle token vision (tokens see by their own senses), and set the darkness level (0 = full daylight, 1 = pitch black). Provide at least one of the three; only the fields you pass are written. Optionally give scene_id to target a specific (e.g. freshly generated) scene; otherwise the active scene is used. Focused front-end over update-scene — builds the right (v13-nested) fields object for you: global illumination and darkness go under environment, token vision is top-level. No token/actor is targeted. Returns { success, sceneId, updatedFields }.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            global_illumination: {
+              type: 'boolean',
+              description:
+                'Optional. Enable/disable scene-wide global illumination (lights the whole map regardless of token vision).',
+            },
+            token_vision: {
+              type: 'boolean',
+              description:
+                'Optional. Enable/disable token vision (whether tokens see limited by their own senses).',
+            },
+            darkness_level: {
+              type: 'number',
+              minimum: 0,
+              maximum: 1,
+              description:
+                'Optional. Scene darkness level from 0 (full daylight) to 1 (complete darkness).',
+            },
+            scene_id: {
+              type: 'string',
+              description: 'Optional. ID of the target scene. Defaults to the active scene.',
+            },
+          },
+        },
+      },
     ];
   }
 
@@ -190,6 +221,61 @@ export class SceneTools {
 
     return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
       fields: { background: { src } },
+      ...(scene_id ? { sceneId: scene_id } : {}),
+    });
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §5.4) — configure-scene-vision-lighting. Slice-builder
+   * front-end over the shared updateScene seam: constructs the narrow vision/lighting
+   * fields object and forwards it to the same GM-scoped updateScene query. Adds no
+   * data-access method (the whitelist + scene.update() live Foundry-side). Only the
+   * fields the caller supplied are written (exactOptionalPropertyTypes ON → spread
+   * conditionally, never pass undefined). v13 field paths: global illumination and
+   * darkness nest under environment (environment.globalLight.enabled /
+   * environment.darknessLevel); token vision stays top-level (tokenVision). No
+   * token/actor target, so no gate.
+   */
+  async handleConfigureSceneVisionLighting(args: any): Promise<any> {
+    const schema = z.object({
+      global_illumination: z.boolean().optional(),
+      token_vision: z.boolean().optional(),
+      darkness_level: z.number().min(0).max(1).optional(),
+      scene_id: z.string().min(1).optional(),
+    });
+
+    const { global_illumination, token_vision, darkness_level, scene_id } = schema.parse(args);
+
+    if (
+      global_illumination === undefined &&
+      token_vision === undefined &&
+      darkness_level === undefined
+    ) {
+      throw new Error(
+        'Provide at least one of global_illumination, token_vision, or darkness_level'
+      );
+    }
+
+    // v13-nested lighting fields collapse under a single environment sub-object.
+    const environment = {
+      ...(global_illumination !== undefined
+        ? { globalLight: { enabled: global_illumination } }
+        : {}),
+      ...(darkness_level !== undefined ? { darknessLevel: darkness_level } : {}),
+    };
+
+    const fields = {
+      ...(token_vision !== undefined ? { tokenVision: token_vision } : {}),
+      ...(Object.keys(environment).length > 0 ? { environment } : {}),
+    };
+
+    this.logger.info('Configuring scene vision/lighting', {
+      scene_id: scene_id ?? '(active)',
+      fields: Object.keys(fields),
+    });
+
+    return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
+      fields,
       ...(scene_id ? { sceneId: scene_id } : {}),
     });
   }

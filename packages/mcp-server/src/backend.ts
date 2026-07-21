@@ -1585,6 +1585,11 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'configure-scene-vision-lighting':
+                  result = await sceneTools.handleConfigureSceneVisionLighting(args);
+
+                  break;
+
                 case 'get-world-info':
                   result = await sceneTools.handleGetWorldInfo(args);
 
