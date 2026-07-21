@@ -70,6 +70,26 @@ export class SceneTools {
           required: ['fields'],
         },
       },
+      {
+        name: 'set-scene-background',
+        description:
+          "Set a scene's background image without opening Scene Configuration by hand. Give an image path (src, e.g. 'worlds/my-world/maps/dungeon.webp' or a generated-map path) and the scene's hasBackground flag flips true so the map renders instead of grey. Optionally give scene_id to target a specific (e.g. freshly generated) scene; otherwise the active scene is used. Focused front-end over update-scene — builds { background: { src } } for you. No token/actor is targeted. Returns { success, sceneId, updatedFields }.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            src: {
+              type: 'string',
+              description:
+                "Image path to wire as the scene background (e.g. 'worlds/<world>/maps/<file>.webp').",
+            },
+            scene_id: {
+              type: 'string',
+              description: 'Optional. ID of the target scene. Defaults to the active scene.',
+            },
+          },
+          required: ['src'],
+        },
+      },
     ];
   }
 
@@ -143,6 +163,33 @@ export class SceneTools {
 
     return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
       fields,
+      ...(scene_id ? { sceneId: scene_id } : {}),
+    });
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §5.3) — set-scene-background. Slice-builder front-end
+   * over the shared updateScene seam: constructs the narrow { background: { src } }
+   * fields object and forwards it to the same GM-scoped updateScene query. Adds no
+   * data-access method (the whitelist + scene.update() live Foundry-side). Wiring
+   * src flips the read-side hasBackground flag true so the map renders. No
+   * token/actor target, so no gate.
+   */
+  async handleSetSceneBackground(args: any): Promise<any> {
+    const schema = z.object({
+      src: z.string().min(1),
+      scene_id: z.string().min(1).optional(),
+    });
+
+    const { src, scene_id } = schema.parse(args);
+
+    this.logger.info('Setting scene background', {
+      scene_id: scene_id ?? '(active)',
+      src,
+    });
+
+    return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
+      fields: { background: { src } },
       ...(scene_id ? { sceneId: scene_id } : {}),
     });
   }

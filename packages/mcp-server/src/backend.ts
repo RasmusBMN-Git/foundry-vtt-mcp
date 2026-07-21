@@ -1580,6 +1580,11 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'set-scene-background':
+                  result = await sceneTools.handleSetSceneBackground(args);
+
+                  break;
+
                 case 'get-world-info':
                   result = await sceneTools.handleGetWorldInfo(args);
 
