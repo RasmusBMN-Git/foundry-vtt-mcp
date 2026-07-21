@@ -1,6 +1,30 @@
 import { MODULE_ID, CONNECTION_STATES } from './constants.js';
 import { WebRTCConnection, type WebRTCConfig } from './webrtc-connection.js';
 
+/**
+ * T36 verb 7 (scene-mgmt-SPEC §5.7) — decide the background-only repair for a freshly
+ * created generated-map scene. In Foundry v13 the scene image lives at `background.src`;
+ * the legacy top-level `img` alias is unreliable, so a generated scene renders grey when
+ * the background never lands on the created document. Returns a **background-only**
+ * `scene.update()` payload when the created scene is missing its background src, or `null`
+ * when it is already wired (no redundant write). It never emits lighting/vision fields —
+ * playable lighting stays a deliberate `configure-scene-vision-lighting` step (locked scope,
+ * Rasmus 2026-07-21).
+ */
+export function resolveGeneratedSceneBackgroundUpdate(
+  sceneData: { background?: { src?: string }; img?: string } | null | undefined,
+  createdScene:
+    | { background?: { src?: string }; _source?: { background?: { src?: string } } }
+    | null
+    | undefined
+): { background: { src: string } } | null {
+  const desiredSrc = sceneData?.background?.src ?? sceneData?.img;
+  if (!desiredSrc) return null;
+  const persistedSrc = createdScene?.background?.src ?? createdScene?._source?.background?.src;
+  if (persistedSrc) return null;
+  return { background: { src: desiredSrc } };
+}
+
 export interface BridgeConfig {
   enabled: boolean;
   serverHost: string;
@@ -328,12 +352,19 @@ export class SocketBridge {
       const scene = await (globalThis as any).Scene.create(sceneData);
       console.log(`[foundry-mcp-bridge] Scene created successfully:`, scene);
 
-      // CRITICAL: Foundry v13 bug workaround (like working mapgen system)
-      if (!scene.img && sceneData.img) {
-        await scene.update({
-          img: sceneData.img,
-          background: { src: sceneData.img },
-        });
+      // T36 verb 7 (scene-mgmt-SPEC §5.7): wire the generated image as the scene
+      // background so the map renders instead of grey. Foundry v13 stores the image at
+      // `background.src`; the deprecated top-level `img` alias is unreliable, and issuing
+      // `scene.update({ img, ... })` can void the whole write on an unknown key. So verify
+      // the background landed on the created document and repair with a BACKGROUND-ONLY
+      // update if it did not — no lighting/vision fields touched.
+      const backgroundUpdate = resolveGeneratedSceneBackgroundUpdate(sceneData, scene);
+      if (backgroundUpdate) {
+        console.log(
+          `[foundry-mcp-bridge] Wiring scene background src:`,
+          backgroundUpdate.background.src
+        );
+        await scene.update(backgroundUpdate);
       }
 
       if (sceneData.walls && sceneData.walls.length > 0) {
