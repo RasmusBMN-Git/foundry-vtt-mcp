@@ -41,6 +41,22 @@ export function resolveGeneratedSceneBackgroundUpdate(
   return { levels: clonedLevels };
 }
 
+/**
+ * T36-FIX-2 (live gate 2026-07-21): `Scene.create` runs Foundry's DataModel cleaning on the
+ * payload **in place** — v14 strips the deprecated `background.src` and the legacy `img`
+ * straight off `sceneData` (verified live: `new Scene(d)` leaves `d.img === null` and
+ * `d.background === { offsetX, offsetY }`). Reading the desired src *after* the create call
+ * therefore always yields undefined and the repair above silently no-ops → grey scene.
+ * Snapshot the src BEFORE creating; `image_path` (carried separately on the job-completed
+ * message and never handed to the DataModel) is the untouched fallback.
+ */
+export function resolveGeneratedMapBackgroundSrc(
+  sceneData: { background?: { src?: string }; img?: string } | null | undefined,
+  imagePath?: string | null
+): string | null {
+  return sceneData?.background?.src ?? sceneData?.img ?? imagePath ?? null;
+}
+
 export interface BridgeConfig {
   enabled: boolean;
   serverHost: string;
@@ -365,6 +381,8 @@ export class SocketBridge {
 
       // Create the scene using the complete payload from backend
       console.log(`[foundry-mcp-bridge] Attempting to create scene...`);
+      // Snapshot BEFORE Scene.create — it cleans sceneData in place and drops background/img.
+      const desiredBackgroundSrc = resolveGeneratedMapBackgroundSrc(sceneData, data.image_path);
       const scene = await (globalThis as any).Scene.create(sceneData);
       console.log(`[foundry-mcp-bridge] Scene created successfully:`, scene);
 
@@ -374,7 +392,12 @@ export class SocketBridge {
       // field (writes silently dropped) into `levels[0].background.src`, so verify the
       // background landed on the created document's first level and repair with a
       // LEVELS-ONLY update if it did not — no lighting/vision fields touched.
-      const backgroundUpdate = resolveGeneratedSceneBackgroundUpdate(sceneData, scene);
+      const backgroundUpdate = desiredBackgroundSrc
+        ? resolveGeneratedSceneBackgroundUpdate(
+            { background: { src: desiredBackgroundSrc } },
+            scene
+          )
+        : null;
       if (backgroundUpdate) {
         console.log(
           `[foundry-mcp-bridge] Wiring scene background src:`,
