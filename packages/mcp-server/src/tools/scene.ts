@@ -121,6 +121,52 @@ export class SceneTools {
           },
         },
       },
+      {
+        name: 'set-scene-grid-dimensions',
+        description:
+          "Set a scene's grid and/or canvas dimensions without opening Scene Configuration by hand. Grid fields — grid_size (pixels per grid square, e.g. 100), grid_type (Foundry grid type: 0 gridless, 1 square, 2 hex-odd-rows, 3 hex-even-rows, 4 hex-odd-cols, 5 hex-even-cols), grid_distance (how much real distance one square represents, e.g. 5), grid_units (unit label, e.g. 'ft') — are collapsed into the nested grid object Foundry v13 expects. Canvas dimensions width and height are top-level pixel sizes. Provide at least one field; only the fields you pass are written. Optionally give scene_id to target a specific (e.g. freshly generated) scene; otherwise the active scene is used. Focused front-end over update-scene — builds { grid: {…}, width, height } for you. No token/actor is targeted. Returns { success, sceneId, updatedFields }.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            grid_size: {
+              type: 'number',
+              minimum: 50,
+              description:
+                'Optional. Grid square size in pixels (Foundry hard minimum 50). Nested under grid.size.',
+            },
+            grid_type: {
+              type: 'number',
+              description:
+                'Optional. Foundry grid type constant (0 gridless, 1 square, 2-5 hex variants). Nested under grid.type.',
+            },
+            grid_distance: {
+              type: 'number',
+              minimum: 0,
+              description:
+                'Optional. Distance one grid square represents (e.g. 5). Nested under grid.distance.',
+            },
+            grid_units: {
+              type: 'string',
+              description:
+                "Optional. Unit label for grid distance (e.g. 'ft', 'm'). Nested under grid.units.",
+            },
+            width: {
+              type: 'number',
+              minimum: 1,
+              description: 'Optional. Scene canvas width in pixels (top-level).',
+            },
+            height: {
+              type: 'number',
+              minimum: 1,
+              description: 'Optional. Scene canvas height in pixels (top-level).',
+            },
+            scene_id: {
+              type: 'string',
+              description: 'Optional. ID of the target scene. Defaults to the active scene.',
+            },
+          },
+        },
+      },
     ];
   }
 
@@ -270,6 +316,70 @@ export class SceneTools {
     };
 
     this.logger.info('Configuring scene vision/lighting', {
+      scene_id: scene_id ?? '(active)',
+      fields: Object.keys(fields),
+    });
+
+    return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
+      fields,
+      ...(scene_id ? { sceneId: scene_id } : {}),
+    });
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §5.5) — set-scene-grid-dimensions. Slice-builder
+   * front-end over the shared updateScene seam: constructs the narrow
+   * grid/dimensions fields object and forwards it to the same GM-scoped
+   * updateScene query. Adds no data-access method (the whitelist + scene.update()
+   * live Foundry-side). Only the fields the caller supplied are written
+   * (exactOptionalPropertyTypes ON → spread conditionally, never pass undefined).
+   * v13 field paths (live-confirmed on Foundry 14.364): grid is the nested
+   * scene.grid object ({ type, size, distance, units }); width/height are
+   * top-level. This is the paired write to the grid.size/grid.distance the T32
+   * scene read already surfaces. No token/actor target, so no gate.
+   */
+  async handleSetSceneGridDimensions(args: any): Promise<any> {
+    const schema = z.object({
+      grid_size: z.number().min(50).optional(),
+      grid_type: z.number().optional(),
+      grid_distance: z.number().min(0).optional(),
+      grid_units: z.string().min(1).optional(),
+      width: z.number().min(1).optional(),
+      height: z.number().min(1).optional(),
+      scene_id: z.string().min(1).optional(),
+    });
+
+    const { grid_size, grid_type, grid_distance, grid_units, width, height, scene_id } =
+      schema.parse(args);
+
+    if (
+      grid_size === undefined &&
+      grid_type === undefined &&
+      grid_distance === undefined &&
+      grid_units === undefined &&
+      width === undefined &&
+      height === undefined
+    ) {
+      throw new Error(
+        'Provide at least one of grid_size, grid_type, grid_distance, grid_units, width, or height'
+      );
+    }
+
+    // v13 grid fields collapse under a single nested grid sub-object.
+    const grid = {
+      ...(grid_type !== undefined ? { type: grid_type } : {}),
+      ...(grid_size !== undefined ? { size: grid_size } : {}),
+      ...(grid_distance !== undefined ? { distance: grid_distance } : {}),
+      ...(grid_units !== undefined ? { units: grid_units } : {}),
+    };
+
+    const fields = {
+      ...(Object.keys(grid).length > 0 ? { grid } : {}),
+      ...(width !== undefined ? { width } : {}),
+      ...(height !== undefined ? { height } : {}),
+    };
+
+    this.logger.info('Setting scene grid/dimensions', {
       scene_id: scene_id ?? '(active)',
       fields: Object.keys(fields),
     });

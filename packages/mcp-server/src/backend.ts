@@ -1590,6 +1590,11 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'set-scene-grid-dimensions':
+                  result = await sceneTools.handleSetSceneGridDimensions(args);
+
+                  break;
+
                 case 'get-world-info':
                   result = await sceneTools.handleGetWorldInfo(args);
 
