@@ -3,26 +3,42 @@ import { WebRTCConnection, type WebRTCConfig } from './webrtc-connection.js';
 
 /**
  * T36 verb 7 (scene-mgmt-SPEC §5.7) — decide the background-only repair for a freshly
- * created generated-map scene. In Foundry v13 the scene image lives at `background.src`;
- * the legacy top-level `img` alias is unreliable, so a generated scene renders grey when
- * the background never lands on the created document. Returns a **background-only**
- * `scene.update()` payload when the created scene is missing its background src, or `null`
- * when it is already wired (no redundant write). It never emits lighting/vision fields —
- * playable lighting stays a deliberate `configure-scene-vision-lighting` step (locked scope,
- * Rasmus 2026-07-21).
+ * created generated-map scene. **T36-FIX (OPS 2026-07-21 E1):** Foundry 14.364's Scene
+ * Levels feature moved the background image out of the deprecated top-level
+ * `Scene#background` field (writes now silently dropped) into a per-level array — the
+ * real persist target is `scene._source.levels[0].background.src` (default level
+ * `defaultLevel0000`, auto-created by `Scene.create`). Returns a **levels-only** update —
+ * the existing levels array deep-cloned with `[0].background.src` set — when the created
+ * scene's first level is missing its background src, or `null` when it is already wired
+ * (no redundant write) or when the scene has no levels scaffold to repair (guards rather
+ * than throws). It never emits lighting/vision fields — playable lighting stays a
+ * deliberate `configure-scene-vision-lighting` step (locked scope, Rasmus 2026-07-21).
  */
+interface SceneLevel {
+  background?: { src?: string };
+  [key: string]: unknown;
+}
+
 export function resolveGeneratedSceneBackgroundUpdate(
   sceneData: { background?: { src?: string }; img?: string } | null | undefined,
-  createdScene:
-    | { background?: { src?: string }; _source?: { background?: { src?: string } } }
-    | null
-    | undefined
-): { background: { src: string } } | null {
+  createdScene: { _source?: { levels?: Array<SceneLevel | null | undefined> } } | null | undefined
+): { levels: SceneLevel[] } | null {
   const desiredSrc = sceneData?.background?.src ?? sceneData?.img;
   if (!desiredSrc) return null;
-  const persistedSrc = createdScene?.background?.src ?? createdScene?._source?.background?.src;
+
+  const levels = createdScene?._source?.levels;
+  if (!Array.isArray(levels) || levels.length === 0) return null;
+
+  const persistedSrc = levels[0]?.background?.src;
   if (persistedSrc) return null;
-  return { background: { src: desiredSrc } };
+
+  const clonedLevels: SceneLevel[] = levels.map((level, index) =>
+    index === 0
+      ? { ...(level ?? {}), background: { ...(level?.background ?? {}), src: desiredSrc } }
+      : (level ?? {})
+  );
+
+  return { levels: clonedLevels };
 }
 
 export interface BridgeConfig {
@@ -352,17 +368,17 @@ export class SocketBridge {
       const scene = await (globalThis as any).Scene.create(sceneData);
       console.log(`[foundry-mcp-bridge] Scene created successfully:`, scene);
 
-      // T36 verb 7 (scene-mgmt-SPEC §5.7): wire the generated image as the scene
-      // background so the map renders instead of grey. Foundry v13 stores the image at
-      // `background.src`; the deprecated top-level `img` alias is unreliable, and issuing
-      // `scene.update({ img, ... })` can void the whole write on an unknown key. So verify
-      // the background landed on the created document and repair with a BACKGROUND-ONLY
-      // update if it did not — no lighting/vision fields touched.
+      // T36 verb 7 (scene-mgmt-SPEC §5.7) — T36-FIX (OPS 2026-07-21 E1): wire the
+      // generated image as the scene background so the map renders instead of grey.
+      // Foundry 14.364 moved the background off the deprecated top-level `background`
+      // field (writes silently dropped) into `levels[0].background.src`, so verify the
+      // background landed on the created document's first level and repair with a
+      // LEVELS-ONLY update if it did not — no lighting/vision fields touched.
       const backgroundUpdate = resolveGeneratedSceneBackgroundUpdate(sceneData, scene);
       if (backgroundUpdate) {
         console.log(
           `[foundry-mcp-bridge] Wiring scene background src:`,
-          backgroundUpdate.background.src
+          backgroundUpdate.levels[0]?.background?.src
         );
         await scene.update(backgroundUpdate);
       }

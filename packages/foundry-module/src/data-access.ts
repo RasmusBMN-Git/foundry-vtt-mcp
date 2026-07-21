@@ -5488,6 +5488,9 @@ export class FoundryDataAccess {
     // dimensions, name, padding. Exact nested paths (e.g. v13
     // environment.globalLight.enabled) are the caller's concern; this guard only
     // gates the top-level keys so nothing outside the surface is ever written.
+    // T36-FIX (OPS 2026-07-21 E1): `levels` added — the actual v14 persist target for
+    // a translated `background.src` write (see below); the public `background` key
+    // stays whitelisted too since that's the contract callers still send.
     const WRITABLE = new Set<string>([
       'name',
       'background',
@@ -5501,6 +5504,7 @@ export class FoundryDataAccess {
       'environment',
       'initial',
       'backgroundColor',
+      'levels',
     ]);
 
     if (
@@ -5525,8 +5529,31 @@ export class FoundryDataAccess {
       throw new Error(sceneId ? `Scene not found: ${sceneId}` : 'No active scene found');
     }
 
+    // T36-FIX (OPS 2026-07-21 E1): a `background.src` write is dead on v14 — Scene
+    // Levels moved the persist target to `levels[0].background.src`. Translate it
+    // Foundry-side so the public contract (callers still send `{ background: { src } }`)
+    // is unchanged. Deep-clone the scene's existing levels and patch index 0 only; if
+    // the scene has no levels scaffold (pre-v14 world, or unexpected schema), fall back
+    // to writing `fields` as given rather than throwing.
+    let writeFields = fields;
+    if (fields.background?.src) {
+      const existingLevels = scene._source?.levels;
+      if (Array.isArray(existingLevels) && existingLevels.length > 0) {
+        const clonedLevels = existingLevels.map((level: any, index: number) =>
+          index === 0
+            ? {
+                ...(level ?? {}),
+                background: { ...(level?.background ?? {}), src: fields.background.src },
+              }
+            : level
+        );
+        const { background: _background, ...rest } = fields;
+        writeFields = { ...rest, levels: clonedLevels };
+      }
+    }
+
     try {
-      await scene.update(fields);
+      await scene.update(writeFields);
       this.auditLog(
         'updateSceneFields',
         { sceneId: scene.id, fields: Object.keys(fields) },
