@@ -1609,6 +1609,13 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                // Place an existing world actor's token on a scene (T36)
+
+                case 'place-existing-actor-token':
+                  result = await actorManagementTools.handlePlaceExistingActorToken(args);
+
+                  break;
+
                 // DSA5 character creation tools
 
                 case 'create-dsa5-character-from-archetype':

@@ -338,6 +338,10 @@ interface SceneTokenPlacement {
   placement: 'random' | 'grid' | 'center' | 'coordinates';
   hidden: boolean;
   coordinates?: { x: number; y: number }[];
+  // T36 (scene-mgmt-SPEC §5.2): optional target scene. When omitted, placement
+  // falls back to the active scene (prior behavior). Lets the DM drop a token on
+  // a named/generated scene without switching to it first.
+  sceneId?: string;
 }
 
 interface TokenPlacementResult {
@@ -5381,9 +5385,14 @@ export class FoundryDataAccess {
     // Audit the permission check
     permissionManager.auditPermissionCheck('modifyScene', permissionCheck, placement);
 
-    const scene = (game.scenes as any).current;
+    // T36: place onto the named target scene when given, else the active scene.
+    const scene = placement.sceneId
+      ? (game.scenes as any).get(placement.sceneId)
+      : (game.scenes as any).current;
     if (!scene) {
-      throw new Error('No active scene found');
+      throw new Error(
+        placement.sceneId ? `Scene not found: ${placement.sceneId}` : 'No active scene found'
+      );
     }
 
     this.auditLog('addActorsToScene', placement, 'success');

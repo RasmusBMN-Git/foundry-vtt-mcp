@@ -578,8 +578,10 @@ export class QueryHandlers {
    */
   private async handleAddActorsToScene(data: {
     actorIds: string[];
-    placement?: 'random' | 'grid' | 'center';
+    placement?: 'random' | 'grid' | 'center' | 'coordinates';
     hidden?: boolean;
+    coordinates?: { x: number; y: number }[];
+    sceneId?: string;
   }): Promise<any> {
     try {
       // SECURITY: Silent GM validation
@@ -598,6 +600,11 @@ export class QueryHandlers {
         actorIds: data.actorIds,
         placement: data.placement || 'random',
         hidden: data.hidden || false,
+        // T36: pass coordinates + target scene through so place-existing-actor-token
+        // can drop a token at an exact spot on a named/generated scene. Spread
+        // conditionally — exactOptionalPropertyTypes forbids passing `undefined`.
+        ...(data.coordinates ? { coordinates: data.coordinates } : {}),
+        ...(data.sceneId ? { sceneId: data.sceneId } : {}),
       });
     } catch (error) {
       throw new Error(
