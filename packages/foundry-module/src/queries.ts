@@ -127,6 +127,7 @@ export class QueryHandlers {
     // Turn bookkeeping (T-ADV)
     CONFIG.queries[`${modulePrefix}.advanceTurn`] = this.handleAdvanceTurn.bind(this);
     CONFIG.queries[`${modulePrefix}.endCombat`] = this.handleEndCombat.bind(this);
+    CONFIG.queries[`${modulePrefix}.updateScene`] = this.handleUpdateScene.bind(this);
 
     // Map generation queries (hybrid architecture)
     CONFIG.queries[`${modulePrefix}.generate-map`] = this.handleGenerateMap.bind(this);
@@ -1584,6 +1585,33 @@ export class QueryHandlers {
     } catch (error) {
       throw new Error(
         `Failed to end combat: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T36 — update-scene. Shared scene-write seam (scene-mgmt-SPEC §3/§5.6): the
+   * validated umbrella over scene.update() that the field setters also front. No
+   * token/actor target, so no target-check gate. GM-only. The whitelist guard
+   * lives in dataAccess.updateSceneFields.
+   */
+  private async handleUpdateScene(data: {
+    sceneId?: string;
+    fields: Record<string, any>;
+  }): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+      if (!data.fields || typeof data.fields !== 'object') {
+        throw new Error('fields object is required');
+      }
+      return await this.dataAccess.updateSceneFields(data.sceneId, data.fields);
+    } catch (error) {
+      throw new Error(
+        `Failed to update scene: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

@@ -1575,6 +1575,11 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'update-scene':
+                  result = await sceneTools.handleUpdateScene(args);
+
+                  break;
+
                 case 'get-world-info':
                   result = await sceneTools.handleGetWorldInfo(args);
 

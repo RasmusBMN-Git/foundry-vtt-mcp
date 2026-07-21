@@ -49,6 +49,27 @@ export class SceneTools {
           properties: {},
         },
       },
+      {
+        name: 'update-scene',
+        description:
+          "Update scene-document fields on a scene without opening Scene Configuration by hand — the umbrella scene editor. Pass a fields object with one or more whitelisted top-level keys: name, background, foreground, width, height, padding, grid, tokenVision, globalLight, environment, initial, backgroundColor. Any key outside that whitelist is rejected (nothing is silently written). background wires an image, e.g. { background: { src: 'worlds/…/map.webp' } }; grid takes { size, type, distance, units }; tokenVision/globalLight toggle lighting. Give scene_id to target a specific (e.g. freshly generated) scene, otherwise the active scene is updated. This is scene-doc bookkeeping only — no token/actor is targeted. Returns { success, sceneId, updatedFields }. For focused edits prefer set-scene-background / configure-scene-vision-lighting / set-scene-grid-dimensions, which build the right fields for you.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            scene_id: {
+              type: 'string',
+              description: 'Optional. ID of the target scene. Defaults to the active scene.',
+            },
+            fields: {
+              type: 'object',
+              description:
+                'Scene fields to update. Whitelisted top-level keys only: name, background, foreground, width, height, padding, grid, tokenVision, globalLight, environment, initial, backgroundColor.',
+              additionalProperties: true,
+            },
+          },
+          required: ['fields'],
+        },
+      },
     ];
   }
 
@@ -98,6 +119,32 @@ export class SceneTools {
         `Failed to get world information: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §3/§5.6) — update-scene. Forwards a whitelisted fields
+   * object to the module's GM-scoped updateScene query. Shared seam that the
+   * field setters (background / vision-lighting / grid-dimensions) also front. No
+   * token/actor target, so no gate. The whitelist is enforced Foundry-side; a
+   * rejected field surfaces as a thrown error, never a silent success.
+   */
+  async handleUpdateScene(args: any): Promise<any> {
+    const schema = z.object({
+      scene_id: z.string().min(1).optional(),
+      fields: z.record(z.any()),
+    });
+
+    const { scene_id, fields } = schema.parse(args);
+
+    this.logger.info('Updating scene fields', {
+      scene_id: scene_id ?? '(active)',
+      fields: Object.keys(fields ?? {}),
+    });
+
+    return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
+      fields,
+      ...(scene_id ? { sceneId: scene_id } : {}),
+    });
   }
 
   private formatSceneResponse(sceneData: any, includeTokens: boolean, includeHidden: boolean): any {

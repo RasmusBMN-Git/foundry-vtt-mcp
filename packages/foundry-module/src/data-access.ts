@@ -5473,6 +5473,80 @@ export class FoundryDataAccess {
   }
 
   /**
+   * T36 (scene-mgmt-SPEC §3 / §5.6) — shared scene-write seam. A validated
+   * umbrella over Foundry's native `scene.update()`: the `update-scene` verb and
+   * the three field setters (background / vision-lighting / grid-dimensions) all
+   * route through here. Only whitelisted top-level scene fields may be written —
+   * any other key is rejected, never silently written. No token/actor target, so
+   * no target-check gate (scene-doc write only). Targets the given scene, else the
+   * active scene.
+   */
+  async updateSceneFields(sceneId: string | undefined, fields: Record<string, any>): Promise<any> {
+    this.validateFoundryState();
+
+    // Whitelist (frozen surface, §3): background, vision/lighting, grid,
+    // dimensions, name, padding. Exact nested paths (e.g. v13
+    // environment.globalLight.enabled) are the caller's concern; this guard only
+    // gates the top-level keys so nothing outside the surface is ever written.
+    const WRITABLE = new Set<string>([
+      'name',
+      'background',
+      'foreground',
+      'width',
+      'height',
+      'padding',
+      'grid',
+      'tokenVision',
+      'globalLight',
+      'environment',
+      'initial',
+      'backgroundColor',
+    ]);
+
+    if (
+      !fields ||
+      typeof fields !== 'object' ||
+      Array.isArray(fields) ||
+      Object.keys(fields).length === 0
+    ) {
+      throw new Error('fields must be a non-empty object of scene properties to update');
+    }
+
+    const rejected = Object.keys(fields).filter(k => !WRITABLE.has(k));
+    if (rejected.length > 0) {
+      throw new Error(
+        `Refusing to write non-whitelisted scene field(s): ${rejected.join(', ')}. ` +
+          `Allowed top-level keys: ${[...WRITABLE].join(', ')}`
+      );
+    }
+
+    const scene = sceneId ? (game.scenes as any).get(sceneId) : (game.scenes as any).current;
+    if (!scene) {
+      throw new Error(sceneId ? `Scene not found: ${sceneId}` : 'No active scene found');
+    }
+
+    try {
+      await scene.update(fields);
+      this.auditLog(
+        'updateSceneFields',
+        { sceneId: scene.id, fields: Object.keys(fields) },
+        'success'
+      );
+      return { success: true, sceneId: scene.id, updatedFields: Object.keys(fields) };
+    } catch (error) {
+      this.auditLog(
+        'updateSceneFields',
+        { sceneId, fields: Object.keys(fields) },
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to update scene: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
    * Find best matching compendium entry for creature type
    */
   private async findBestCompendiumMatch(
