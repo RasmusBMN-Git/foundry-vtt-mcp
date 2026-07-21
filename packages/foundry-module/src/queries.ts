@@ -126,6 +126,7 @@ export class QueryHandlers {
 
     // Turn bookkeeping (T-ADV)
     CONFIG.queries[`${modulePrefix}.advanceTurn`] = this.handleAdvanceTurn.bind(this);
+    CONFIG.queries[`${modulePrefix}.endCombat`] = this.handleEndCombat.bind(this);
 
     // Map generation queries (hybrid architecture)
     CONFIG.queries[`${modulePrefix}.generate-map`] = this.handleGenerateMap.bind(this);
@@ -1557,6 +1558,25 @@ export class QueryHandlers {
     } catch (error) {
       throw new Error(
         `Failed to advance turn: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T36 — end-combat. Combat-lifecycle bookkeeping (scene-mgmt-SPEC §5.1): no
+   * token/actor target, so no target-check gate and no D4 approval. GM-only.
+   */
+  private async handleEndCombat(): Promise<any> {
+    try {
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+      this.dataAccess.validateFoundryState();
+      return await this.dataAccess.endCombat();
+    } catch (error) {
+      throw new Error(
+        `Failed to end combat: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

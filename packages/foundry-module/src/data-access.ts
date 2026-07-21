@@ -7820,6 +7820,49 @@ export class FoundryDataAccess {
   }
 
   /**
+   * T36 — end the active combat encounter. Scene-management layer
+   * (/bridge/scene-mgmt-SPEC.md §5.1): pure combat-lifecycle bookkeeping, no
+   * token/actor target, so no target-check gate and no D4 approval.
+   *
+   * Primitive note: native `Combat#endCombat()` pops a GM confirmation Dialog
+   * (hands-off-hostile, the same reason V1 barred `use-item`'s configureDialog).
+   * We call `combat.delete()` directly — the frozen hard-delete fallback (§5.1) —
+   * so it runs with no dialog. The module's `deleteCombat` hook still fires, so any
+   * in-flight `wait_for_turn` resolves `combat_ended` cleanly (combat-turn-watcher).
+   */
+  async endCombat(): Promise<any> {
+    this.validateFoundryState();
+
+    try {
+      const combat = (game as any).combat;
+      if (!combat) {
+        throw new Error('No active combat to end');
+      }
+
+      const ended = {
+        combatId: combat.id,
+        round: combat.round,
+        combatantCount: combat.combatants?.size ?? 0,
+      };
+
+      await combat.delete();
+
+      this.auditLog('endCombat', ended, 'success');
+      return { success: true, ended };
+    } catch (error) {
+      this.auditLog(
+        'endCombat',
+        {},
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to end combat: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
    * T31 — apply typed damage/healing to a token's HP.
    *
    * Calls `actor.applyDamage([{value, type}], {multiplier})` on the target's

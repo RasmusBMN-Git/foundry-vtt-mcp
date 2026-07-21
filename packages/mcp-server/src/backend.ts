@@ -1687,6 +1687,11 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'end-combat':
+                  result = await combatTools.handleEndCombat(args);
+
+                  break;
+
                 // Campaign management tools
 
                 case 'create-campaign-dashboard':

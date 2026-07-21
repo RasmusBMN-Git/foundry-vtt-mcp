@@ -86,6 +86,15 @@ export class CombatTools {
           },
         },
       },
+      {
+        name: 'end-combat',
+        description:
+          "End the active combat encounter. Deletes the current combat so the tracker clears and any in-flight wait-for-turn resolves 'combat_ended'. Use this when the fight is over (all enemies defeated or the party disengages) instead of ending it by hand in Foundry. Combat-lifecycle bookkeeping only: it takes no arguments, targets no token, and needs no approval. Returns { success, ended: { combatId, round, combatantCount } } describing the encounter that was ended. Runs with no confirmation dialog. If there is no active combat it errors — check the tracker first if unsure.",
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
     ];
   }
 
@@ -155,5 +164,16 @@ export class CombatTools {
     return await this.foundryClient.query('foundry-mcp-bridge.getRecentChatMessages', {
       limit,
     });
+  }
+
+  /**
+   * T36: end the active combat. Combat-lifecycle bookkeeping
+   * (/bridge/scene-mgmt-SPEC.md §5.1) — no target, no gate, no approval. Forwards
+   * to the module's GM-scoped endCombat query and returns the summary of the
+   * encounter that was ended. A bridge error (e.g. no active combat) surfaces as
+   * a thrown error, never a silent success.
+   */
+  async handleEndCombat(_args: any): Promise<any> {
+    return await this.foundryClient.query('foundry-mcp-bridge.endCombat', {});
   }
 }
