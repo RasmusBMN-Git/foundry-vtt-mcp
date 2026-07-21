@@ -1575,6 +1575,26 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'update-scene':
+                  result = await sceneTools.handleUpdateScene(args);
+
+                  break;
+
+                case 'set-scene-background':
+                  result = await sceneTools.handleSetSceneBackground(args);
+
+                  break;
+
+                case 'configure-scene-vision-lighting':
+                  result = await sceneTools.handleConfigureSceneVisionLighting(args);
+
+                  break;
+
+                case 'set-scene-grid-dimensions':
+                  result = await sceneTools.handleSetSceneGridDimensions(args);
+
+                  break;
+
                 case 'get-world-info':
                   result = await sceneTools.handleGetWorldInfo(args);
 
@@ -1606,6 +1626,13 @@ async function startBackend(): Promise<void> {
 
                 case 'manage-actors':
                   result = await actorManagementTools.handleManageActors(args);
+
+                  break;
+
+                // Place an existing world actor's token on a scene (T36)
+
+                case 'place-existing-actor-token':
+                  result = await actorManagementTools.handlePlaceExistingActorToken(args);
 
                   break;
 
@@ -1684,6 +1711,11 @@ async function startBackend(): Promise<void> {
 
                 case 'get-recent-chat-messages':
                   result = await combatTools.handleGetRecentChatMessages(args);
+
+                  break;
+
+                case 'end-combat':
+                  result = await combatTools.handleEndCombat(args);
 
                   break;
 

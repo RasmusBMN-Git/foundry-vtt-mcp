@@ -184,6 +184,41 @@ export class ActorManagementTools {
           required: ['action'],
         },
       },
+      {
+        name: 'place-existing-actor-token',
+        description:
+          "Drop a token for an EXISTING world actor onto a scene — including the player character, e.g. re-placing the PC on a freshly generated map without a manual sidebar drag. This places an actor that already exists in the world (use its actor id); it does NOT create a new actor (use manage-actors or create-actor-from-compendium for that). The placed token inherits the actor's prototype-token ownership, so a player-owned PC actor yields a player-controllable token and GM-owned NPCs stay GM-only. Give an actor_id, optionally a scene_id (defaults to the active scene), an optional x/y for exact placement (otherwise it is auto-positioned), and hidden to place it face-down. Returns { success, tokensCreated, tokenIds }.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            actor_id: {
+              type: 'string',
+              description: 'ID of the existing world actor to place (may be the PC actor).',
+            },
+            scene_id: {
+              type: 'string',
+              description:
+                'Optional. ID of the target scene. Defaults to the currently active scene.',
+            },
+            x: {
+              type: 'number',
+              description:
+                'Optional. X pixel coordinate for exact placement. Provide with y; if omitted the token is auto-positioned (centered).',
+            },
+            y: {
+              type: 'number',
+              description:
+                'Optional. Y pixel coordinate for exact placement. Provide with x; if omitted the token is auto-positioned (centered).',
+            },
+            hidden: {
+              type: 'boolean',
+              description: 'Optional. Place the token hidden (GM-only). Default false.',
+              default: false,
+            },
+          },
+          required: ['actor_id'],
+        },
+      },
     ];
   }
 
@@ -356,6 +391,47 @@ export class ActorManagementTools {
     const result = await this.foundryClient.query('foundry-mcp-bridge.deleteActorItems', {
       actorIdentifier,
       itemIds,
+    });
+
+    return result;
+  }
+
+  // ── place-existing-actor-token (T36, scene-mgmt-SPEC §5.2) ──────────────────
+
+  /**
+   * Drop a token for an existing world actor onto a scene (incl. the PC). Wraps
+   * the module's addActorsToScene placement path for a single actor, forwarding
+   * an optional target scene and exact coordinates. Ownership inherits from the
+   * actor's prototype token (§4) — this handler sets no ownership override, so a
+   * player-owned PC yields a player-controllable token and NPCs stay GM-only.
+   * Placement is setup, not a PC decision (D2), so the PC is a valid target here.
+   */
+  async handlePlaceExistingActorToken(args: any): Promise<any> {
+    const schema = z.object({
+      actor_id: z.string().min(1),
+      scene_id: z.string().min(1).optional(),
+      x: z.number().optional(),
+      y: z.number().optional(),
+      hidden: z.boolean().optional().default(false),
+    });
+
+    const { actor_id, scene_id, x, y, hidden } = schema.parse(args);
+
+    const hasCoords = x !== undefined && y !== undefined;
+
+    this.logger.info('Placing existing actor token', {
+      actor_id,
+      scene_id: scene_id ?? '(active)',
+      placement: hasCoords ? 'coordinates' : 'center',
+      hidden,
+    });
+
+    const result = await this.foundryClient.query('foundry-mcp-bridge.addActorsToScene', {
+      actorIds: [actor_id],
+      placement: hasCoords ? 'coordinates' : 'center',
+      hidden,
+      ...(hasCoords ? { coordinates: [{ x, y }] } : {}),
+      ...(scene_id ? { sceneId: scene_id } : {}),
     });
 
     return result;

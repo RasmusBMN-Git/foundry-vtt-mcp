@@ -49,6 +49,124 @@ export class SceneTools {
           properties: {},
         },
       },
+      {
+        name: 'update-scene',
+        description:
+          "Update scene-document fields on a scene without opening Scene Configuration by hand — the umbrella scene editor. Pass a fields object with one or more whitelisted top-level keys: name, background, foreground, width, height, padding, grid, tokenVision, globalLight, environment, initial, backgroundColor. Any key outside that whitelist is rejected (nothing is silently written). background wires an image, e.g. { background: { src: 'worlds/…/map.webp' } }; grid takes { size, type, distance, units }; tokenVision/globalLight toggle lighting. Give scene_id to target a specific (e.g. freshly generated) scene, otherwise the active scene is updated. This is scene-doc bookkeeping only — no token/actor is targeted. Returns { success, sceneId, updatedFields }. For focused edits prefer set-scene-background / configure-scene-vision-lighting / set-scene-grid-dimensions, which build the right fields for you.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            scene_id: {
+              type: 'string',
+              description: 'Optional. ID of the target scene. Defaults to the active scene.',
+            },
+            fields: {
+              type: 'object',
+              description:
+                'Scene fields to update. Whitelisted top-level keys only: name, background, foreground, width, height, padding, grid, tokenVision, globalLight, environment, initial, backgroundColor.',
+              additionalProperties: true,
+            },
+          },
+          required: ['fields'],
+        },
+      },
+      {
+        name: 'set-scene-background',
+        description:
+          "Set a scene's background image without opening Scene Configuration by hand. Give an image path (src, e.g. 'worlds/my-world/maps/dungeon.webp' or a generated-map path) and the scene's hasBackground flag flips true so the map renders instead of grey. Optionally give scene_id to target a specific (e.g. freshly generated) scene; otherwise the active scene is used. Focused front-end over update-scene — builds { background: { src } } for you. No token/actor is targeted. Returns { success, sceneId, updatedFields }.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            src: {
+              type: 'string',
+              description:
+                "Image path to wire as the scene background (e.g. 'worlds/<world>/maps/<file>.webp').",
+            },
+            scene_id: {
+              type: 'string',
+              description: 'Optional. ID of the target scene. Defaults to the active scene.',
+            },
+          },
+          required: ['src'],
+        },
+      },
+      {
+        name: 'configure-scene-vision-lighting',
+        description:
+          "Configure a scene's vision and lighting without opening Scene Configuration by hand. Toggle global illumination (lights the whole map), toggle token vision (tokens see by their own senses), and set the darkness level (0 = full daylight, 1 = pitch black). Provide at least one of the three; only the fields you pass are written. Optionally give scene_id to target a specific (e.g. freshly generated) scene; otherwise the active scene is used. Focused front-end over update-scene — builds the right (v13-nested) fields object for you: global illumination and darkness go under environment, token vision is top-level. No token/actor is targeted. Returns { success, sceneId, updatedFields }.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            global_illumination: {
+              type: 'boolean',
+              description:
+                'Optional. Enable/disable scene-wide global illumination (lights the whole map regardless of token vision).',
+            },
+            token_vision: {
+              type: 'boolean',
+              description:
+                'Optional. Enable/disable token vision (whether tokens see limited by their own senses).',
+            },
+            darkness_level: {
+              type: 'number',
+              minimum: 0,
+              maximum: 1,
+              description:
+                'Optional. Scene darkness level from 0 (full daylight) to 1 (complete darkness).',
+            },
+            scene_id: {
+              type: 'string',
+              description: 'Optional. ID of the target scene. Defaults to the active scene.',
+            },
+          },
+        },
+      },
+      {
+        name: 'set-scene-grid-dimensions',
+        description:
+          "Set a scene's grid and/or canvas dimensions without opening Scene Configuration by hand. Grid fields — grid_size (pixels per grid square, e.g. 100), grid_type (Foundry grid type: 0 gridless, 1 square, 2 hex-odd-rows, 3 hex-even-rows, 4 hex-odd-cols, 5 hex-even-cols), grid_distance (how much real distance one square represents, e.g. 5), grid_units (unit label, e.g. 'ft') — are collapsed into the nested grid object Foundry v13 expects. Canvas dimensions width and height are top-level pixel sizes. Provide at least one field; only the fields you pass are written. Optionally give scene_id to target a specific (e.g. freshly generated) scene; otherwise the active scene is used. Focused front-end over update-scene — builds { grid: {…}, width, height } for you. No token/actor is targeted. Returns { success, sceneId, updatedFields }.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            grid_size: {
+              type: 'number',
+              minimum: 50,
+              description:
+                'Optional. Grid square size in pixels (Foundry hard minimum 50). Nested under grid.size.',
+            },
+            grid_type: {
+              type: 'number',
+              description:
+                'Optional. Foundry grid type constant (0 gridless, 1 square, 2-5 hex variants). Nested under grid.type.',
+            },
+            grid_distance: {
+              type: 'number',
+              minimum: 0,
+              description:
+                'Optional. Distance one grid square represents (e.g. 5). Nested under grid.distance.',
+            },
+            grid_units: {
+              type: 'string',
+              description:
+                "Optional. Unit label for grid distance (e.g. 'ft', 'm'). Nested under grid.units.",
+            },
+            width: {
+              type: 'number',
+              minimum: 1,
+              description: 'Optional. Scene canvas width in pixels (top-level).',
+            },
+            height: {
+              type: 'number',
+              minimum: 1,
+              description: 'Optional. Scene canvas height in pixels (top-level).',
+            },
+            scene_id: {
+              type: 'string',
+              description: 'Optional. ID of the target scene. Defaults to the active scene.',
+            },
+          },
+        },
+      },
     ];
   }
 
@@ -98,6 +216,178 @@ export class SceneTools {
         `Failed to get world information: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §3/§5.6) — update-scene. Forwards a whitelisted fields
+   * object to the module's GM-scoped updateScene query. Shared seam that the
+   * field setters (background / vision-lighting / grid-dimensions) also front. No
+   * token/actor target, so no gate. The whitelist is enforced Foundry-side; a
+   * rejected field surfaces as a thrown error, never a silent success.
+   */
+  async handleUpdateScene(args: any): Promise<any> {
+    const schema = z.object({
+      scene_id: z.string().min(1).optional(),
+      fields: z.record(z.any()),
+    });
+
+    const { scene_id, fields } = schema.parse(args);
+
+    this.logger.info('Updating scene fields', {
+      scene_id: scene_id ?? '(active)',
+      fields: Object.keys(fields ?? {}),
+    });
+
+    return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
+      fields,
+      ...(scene_id ? { sceneId: scene_id } : {}),
+    });
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §5.3) — set-scene-background. Slice-builder front-end
+   * over the shared updateScene seam: constructs the narrow { background: { src } }
+   * fields object and forwards it to the same GM-scoped updateScene query. Adds no
+   * data-access method (the whitelist + scene.update() live Foundry-side). Wiring
+   * src flips the read-side hasBackground flag true so the map renders. No
+   * token/actor target, so no gate.
+   */
+  async handleSetSceneBackground(args: any): Promise<any> {
+    const schema = z.object({
+      src: z.string().min(1),
+      scene_id: z.string().min(1).optional(),
+    });
+
+    const { src, scene_id } = schema.parse(args);
+
+    this.logger.info('Setting scene background', {
+      scene_id: scene_id ?? '(active)',
+      src,
+    });
+
+    return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
+      fields: { background: { src } },
+      ...(scene_id ? { sceneId: scene_id } : {}),
+    });
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §5.4) — configure-scene-vision-lighting. Slice-builder
+   * front-end over the shared updateScene seam: constructs the narrow vision/lighting
+   * fields object and forwards it to the same GM-scoped updateScene query. Adds no
+   * data-access method (the whitelist + scene.update() live Foundry-side). Only the
+   * fields the caller supplied are written (exactOptionalPropertyTypes ON → spread
+   * conditionally, never pass undefined). v13 field paths: global illumination and
+   * darkness nest under environment (environment.globalLight.enabled /
+   * environment.darknessLevel); token vision stays top-level (tokenVision). No
+   * token/actor target, so no gate.
+   */
+  async handleConfigureSceneVisionLighting(args: any): Promise<any> {
+    const schema = z.object({
+      global_illumination: z.boolean().optional(),
+      token_vision: z.boolean().optional(),
+      darkness_level: z.number().min(0).max(1).optional(),
+      scene_id: z.string().min(1).optional(),
+    });
+
+    const { global_illumination, token_vision, darkness_level, scene_id } = schema.parse(args);
+
+    if (
+      global_illumination === undefined &&
+      token_vision === undefined &&
+      darkness_level === undefined
+    ) {
+      throw new Error(
+        'Provide at least one of global_illumination, token_vision, or darkness_level'
+      );
+    }
+
+    // v13-nested lighting fields collapse under a single environment sub-object.
+    const environment = {
+      ...(global_illumination !== undefined
+        ? { globalLight: { enabled: global_illumination } }
+        : {}),
+      ...(darkness_level !== undefined ? { darknessLevel: darkness_level } : {}),
+    };
+
+    const fields = {
+      ...(token_vision !== undefined ? { tokenVision: token_vision } : {}),
+      ...(Object.keys(environment).length > 0 ? { environment } : {}),
+    };
+
+    this.logger.info('Configuring scene vision/lighting', {
+      scene_id: scene_id ?? '(active)',
+      fields: Object.keys(fields),
+    });
+
+    return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
+      fields,
+      ...(scene_id ? { sceneId: scene_id } : {}),
+    });
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §5.5) — set-scene-grid-dimensions. Slice-builder
+   * front-end over the shared updateScene seam: constructs the narrow
+   * grid/dimensions fields object and forwards it to the same GM-scoped
+   * updateScene query. Adds no data-access method (the whitelist + scene.update()
+   * live Foundry-side). Only the fields the caller supplied are written
+   * (exactOptionalPropertyTypes ON → spread conditionally, never pass undefined).
+   * v13 field paths (live-confirmed on Foundry 14.364): grid is the nested
+   * scene.grid object ({ type, size, distance, units }); width/height are
+   * top-level. This is the paired write to the grid.size/grid.distance the T32
+   * scene read already surfaces. No token/actor target, so no gate.
+   */
+  async handleSetSceneGridDimensions(args: any): Promise<any> {
+    const schema = z.object({
+      grid_size: z.number().min(50).optional(),
+      grid_type: z.number().optional(),
+      grid_distance: z.number().min(0).optional(),
+      grid_units: z.string().min(1).optional(),
+      width: z.number().min(1).optional(),
+      height: z.number().min(1).optional(),
+      scene_id: z.string().min(1).optional(),
+    });
+
+    const { grid_size, grid_type, grid_distance, grid_units, width, height, scene_id } =
+      schema.parse(args);
+
+    if (
+      grid_size === undefined &&
+      grid_type === undefined &&
+      grid_distance === undefined &&
+      grid_units === undefined &&
+      width === undefined &&
+      height === undefined
+    ) {
+      throw new Error(
+        'Provide at least one of grid_size, grid_type, grid_distance, grid_units, width, or height'
+      );
+    }
+
+    // v13 grid fields collapse under a single nested grid sub-object.
+    const grid = {
+      ...(grid_type !== undefined ? { type: grid_type } : {}),
+      ...(grid_size !== undefined ? { size: grid_size } : {}),
+      ...(grid_distance !== undefined ? { distance: grid_distance } : {}),
+      ...(grid_units !== undefined ? { units: grid_units } : {}),
+    };
+
+    const fields = {
+      ...(Object.keys(grid).length > 0 ? { grid } : {}),
+      ...(width !== undefined ? { width } : {}),
+      ...(height !== undefined ? { height } : {}),
+    };
+
+    this.logger.info('Setting scene grid/dimensions', {
+      scene_id: scene_id ?? '(active)',
+      fields: Object.keys(fields),
+    });
+
+    return await this.foundryClient.query('foundry-mcp-bridge.updateScene', {
+      fields,
+      ...(scene_id ? { sceneId: scene_id } : {}),
+    });
   }
 
   private formatSceneResponse(sceneData: any, includeTokens: boolean, includeHidden: boolean): any {

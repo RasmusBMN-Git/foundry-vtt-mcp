@@ -338,6 +338,10 @@ interface SceneTokenPlacement {
   placement: 'random' | 'grid' | 'center' | 'coordinates';
   hidden: boolean;
   coordinates?: { x: number; y: number }[];
+  // T36 (scene-mgmt-SPEC §5.2): optional target scene. When omitted, placement
+  // falls back to the active scene (prior behavior). Lets the DM drop a token on
+  // a named/generated scene without switching to it first.
+  sceneId?: string;
 }
 
 interface TokenPlacementResult {
@@ -5381,9 +5385,14 @@ export class FoundryDataAccess {
     // Audit the permission check
     permissionManager.auditPermissionCheck('modifyScene', permissionCheck, placement);
 
-    const scene = (game.scenes as any).current;
+    // T36: place onto the named target scene when given, else the active scene.
+    const scene = placement.sceneId
+      ? (game.scenes as any).get(placement.sceneId)
+      : (game.scenes as any).current;
     if (!scene) {
-      throw new Error('No active scene found');
+      throw new Error(
+        placement.sceneId ? `Scene not found: ${placement.sceneId}` : 'No active scene found'
+      );
     }
 
     this.auditLog('addActorsToScene', placement, 'success');
@@ -5460,6 +5469,107 @@ export class FoundryDataAccess {
         error instanceof Error ? error.message : 'Unknown error'
       );
       throw error;
+    }
+  }
+
+  /**
+   * T36 (scene-mgmt-SPEC §3 / §5.6) — shared scene-write seam. A validated
+   * umbrella over Foundry's native `scene.update()`: the `update-scene` verb and
+   * the three field setters (background / vision-lighting / grid-dimensions) all
+   * route through here. Only whitelisted top-level scene fields may be written —
+   * any other key is rejected, never silently written. No token/actor target, so
+   * no target-check gate (scene-doc write only). Targets the given scene, else the
+   * active scene.
+   */
+  async updateSceneFields(sceneId: string | undefined, fields: Record<string, any>): Promise<any> {
+    this.validateFoundryState();
+
+    // Whitelist (frozen surface, §3): background, vision/lighting, grid,
+    // dimensions, name, padding. Exact nested paths (e.g. v13
+    // environment.globalLight.enabled) are the caller's concern; this guard only
+    // gates the top-level keys so nothing outside the surface is ever written.
+    // T36-FIX (OPS 2026-07-21 E1): `levels` added — the actual v14 persist target for
+    // a translated `background.src` write (see below); the public `background` key
+    // stays whitelisted too since that's the contract callers still send.
+    const WRITABLE = new Set<string>([
+      'name',
+      'background',
+      'foreground',
+      'width',
+      'height',
+      'padding',
+      'grid',
+      'tokenVision',
+      'globalLight',
+      'environment',
+      'initial',
+      'backgroundColor',
+      'levels',
+    ]);
+
+    if (
+      !fields ||
+      typeof fields !== 'object' ||
+      Array.isArray(fields) ||
+      Object.keys(fields).length === 0
+    ) {
+      throw new Error('fields must be a non-empty object of scene properties to update');
+    }
+
+    const rejected = Object.keys(fields).filter(k => !WRITABLE.has(k));
+    if (rejected.length > 0) {
+      throw new Error(
+        `Refusing to write non-whitelisted scene field(s): ${rejected.join(', ')}. ` +
+          `Allowed top-level keys: ${[...WRITABLE].join(', ')}`
+      );
+    }
+
+    const scene = sceneId ? (game.scenes as any).get(sceneId) : (game.scenes as any).current;
+    if (!scene) {
+      throw new Error(sceneId ? `Scene not found: ${sceneId}` : 'No active scene found');
+    }
+
+    // T36-FIX (OPS 2026-07-21 E1): a `background.src` write is dead on v14 — Scene
+    // Levels moved the persist target to `levels[0].background.src`. Translate it
+    // Foundry-side so the public contract (callers still send `{ background: { src } }`)
+    // is unchanged. Deep-clone the scene's existing levels and patch index 0 only; if
+    // the scene has no levels scaffold (pre-v14 world, or unexpected schema), fall back
+    // to writing `fields` as given rather than throwing.
+    let writeFields = fields;
+    if (fields.background?.src) {
+      const existingLevels = scene._source?.levels;
+      if (Array.isArray(existingLevels) && existingLevels.length > 0) {
+        const clonedLevels = existingLevels.map((level: any, index: number) =>
+          index === 0
+            ? {
+                ...(level ?? {}),
+                background: { ...(level?.background ?? {}), src: fields.background.src },
+              }
+            : level
+        );
+        const { background: _background, ...rest } = fields;
+        writeFields = { ...rest, levels: clonedLevels };
+      }
+    }
+
+    try {
+      await scene.update(writeFields);
+      this.auditLog(
+        'updateSceneFields',
+        { sceneId: scene.id, fields: Object.keys(fields) },
+        'success'
+      );
+      return { success: true, sceneId: scene.id, updatedFields: Object.keys(fields) };
+    } catch (error) {
+      this.auditLog(
+        'updateSceneFields',
+        { sceneId, fields: Object.keys(fields) },
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to update scene: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
     }
   }
 
@@ -7815,6 +7925,49 @@ export class FoundryDataAccess {
       );
       throw new Error(
         `Failed to advance turn: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T36 — end the active combat encounter. Scene-management layer
+   * (/bridge/scene-mgmt-SPEC.md §5.1): pure combat-lifecycle bookkeeping, no
+   * token/actor target, so no target-check gate and no D4 approval.
+   *
+   * Primitive note: native `Combat#endCombat()` pops a GM confirmation Dialog
+   * (hands-off-hostile, the same reason V1 barred `use-item`'s configureDialog).
+   * We call `combat.delete()` directly — the frozen hard-delete fallback (§5.1) —
+   * so it runs with no dialog. The module's `deleteCombat` hook still fires, so any
+   * in-flight `wait_for_turn` resolves `combat_ended` cleanly (combat-turn-watcher).
+   */
+  async endCombat(): Promise<any> {
+    this.validateFoundryState();
+
+    try {
+      const combat = (game as any).combat;
+      if (!combat) {
+        throw new Error('No active combat to end');
+      }
+
+      const ended = {
+        combatId: combat.id,
+        round: combat.round,
+        combatantCount: combat.combatants?.size ?? 0,
+      };
+
+      await combat.delete();
+
+      this.auditLog('endCombat', ended, 'success');
+      return { success: true, ended };
+    } catch (error) {
+      this.auditLog(
+        'endCombat',
+        {},
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to end combat: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }
