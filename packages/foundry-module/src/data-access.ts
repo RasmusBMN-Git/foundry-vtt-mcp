@@ -8430,6 +8430,98 @@ export class FoundryDataAccess {
   }
 
   /**
+   * T40 — remove a NAMED ActiveEffect (a spell buff / concentration effect like
+   * "Bless" or "Shield of Faith") from a token's actor. The complement of
+   * `toggleTokenCondition`, which only clears `CONFIG.statusEffects` entries and
+   * throws on a named effect it can't find in that table. This method matches on
+   * the effect's own name/label (case-insensitive) or an exact effect id and
+   * deletes via `deleteEmbeddedDocuments('ActiveEffect', …)` — no
+   * `CONFIG.statusEffects` requirement. It deliberately does NOT match on
+   * `statuses` alone (that stays toggle-token-condition's job), though a
+   * status-backed effect whose name matches is still removable.
+   *
+   * A no-match name is NOT an error — it returns `notFound:true` so Claude can
+   * report "nothing to remove" without a thrown failure.
+   *
+   * Gating (target-check, category 'consequence') happens in the query handler
+   * before this method is ever called — this method assumes the check already
+   * passed (same contract as `applyDamageToToken` / `toggleTokenCondition`).
+   */
+  async removeTokenEffect(data: { tokenId: string; effect: string }): Promise<any> {
+    this.validateFoundryState();
+
+    // Use permission system (coarse GM-write gate; the target-check ran already).
+    const permissionCheck = permissionManager.checkWritePermission('modifyScene', {
+      targetIds: [data.tokenId],
+    });
+
+    if (!permissionCheck.allowed) {
+      throw new Error(`${ERROR_MESSAGES.ACCESS_DENIED}: ${permissionCheck.reason}`);
+    }
+
+    try {
+      const scene = (game.scenes as any).current;
+      if (!scene) {
+        throw new Error('No active scene found');
+      }
+
+      const token = scene.tokens.get(data.tokenId);
+      if (!token) {
+        throw new Error(`Token ${data.tokenId} not found in current scene`);
+      }
+
+      const actor = token.actor;
+      if (!actor) {
+        throw new Error(`Token ${data.tokenId} has no associated actor`);
+      }
+
+      const wanted = String(data.effect ?? '');
+      const wantedLower = wanted.toLowerCase();
+      const effects = actor.effects?.contents || [];
+      const effectsToRemove = effects.filter((effect: any) => {
+        if (effect.id === wanted) return true; // exact effect id
+        if (effect.name?.toLowerCase() === wantedLower) return true; // case-insensitive name
+        if (effect.label?.toLowerCase() === wantedLower) return true; // legacy label
+        return false;
+      });
+
+      const removed = effectsToRemove.map((e: any) => ({ id: e.id, name: e.name || e.label }));
+
+      if (effectsToRemove.length > 0) {
+        await actor.deleteEmbeddedDocuments(
+          'ActiveEffect',
+          effectsToRemove.map((e: any) => e.id)
+        );
+      }
+
+      this.auditLog('removeTokenEffect', data, 'success');
+
+      return {
+        success: true,
+        tokenId: token.id,
+        tokenName: token.name,
+        effect: data.effect,
+        removed,
+        notFound: removed.length === 0,
+        message:
+          removed.length > 0
+            ? `Removed ${removed.map((r: any) => r.name).join(', ')} from ${token.name}`
+            : `No ActiveEffect matching "${data.effect}" on ${token.name}`,
+      };
+    } catch (error) {
+      this.auditLog(
+        'removeTokenEffect',
+        data,
+        'failure',
+        error instanceof Error ? error.message : 'Unknown error'
+      );
+      throw new Error(
+        `Failed to remove token effect: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
    * T34 — roll an NPC's pending save-ends save and clear the condition on
    * success (SPEC §5.6: "T34 must fold in an NPC-roll path for save-ends
    * resolution ... it is not a separate task"). Rolls via the native

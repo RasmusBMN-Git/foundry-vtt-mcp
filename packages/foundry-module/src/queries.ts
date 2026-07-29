@@ -102,6 +102,7 @@ export class QueryHandlers {
     CONFIG.queries[`${modulePrefix}.getTokenDetails`] = this.handleGetTokenDetails.bind(this);
     CONFIG.queries[`${modulePrefix}.toggleTokenCondition`] =
       this.handleToggleTokenCondition.bind(this);
+    CONFIG.queries[`${modulePrefix}.removeTokenEffect`] = this.handleRemoveTokenEffect.bind(this);
     CONFIG.queries[`${modulePrefix}.getAvailableConditions`] =
       this.handleGetAvailableConditions.bind(this);
 
@@ -167,6 +168,7 @@ export class QueryHandlers {
     CONFIG.queries[`${modulePrefix}.get-token-details`] = this.handleGetTokenDetails.bind(this);
     CONFIG.queries[`${modulePrefix}.toggle-token-condition`] =
       this.handleToggleTokenCondition.bind(this);
+    CONFIG.queries[`${modulePrefix}.remove-token-effect`] = this.handleRemoveTokenEffect.bind(this);
     CONFIG.queries[`${modulePrefix}.get-available-conditions`] =
       this.handleGetAvailableConditions.bind(this);
 
@@ -1762,6 +1764,66 @@ export class QueryHandlers {
     } catch (error) {
       throw new Error(
         `Failed to toggle token condition: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * T40 — remove a named ActiveEffect (spell buff / concentration effect) from a
+   * token's actor. Gated the same shape as apply_condition — category
+   * 'consequence'. NPC target → auto. PC target → D4 needs_approval unless
+   * trustedMode (removing a PC's buff is a state change the DM owns, a
+   * consequence, not a D2 decision). The complement of toggle-token-condition:
+   * this clears NAMED effects, that clears status conditions.
+   */
+  private async handleRemoveTokenEffect(data: {
+    tokenId: string;
+    effect: string;
+    trustedMode?: boolean;
+  }): Promise<any> {
+    try {
+      // SECURITY: Silent GM validation
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+
+      this.dataAccess.validateFoundryState();
+
+      if (!data.tokenId) {
+        throw new Error('tokenId is required');
+      }
+      if (!data.effect) {
+        throw new Error('effect is required');
+      }
+
+      const resolveToken = makeLiveTokenResolver();
+      const verdict = checkTarget({
+        token_id: data.tokenId,
+        verb: 'remove_effect',
+        category: 'consequence',
+        trustedMode: data.trustedMode === true,
+        proposed: {
+          effect: data.effect,
+        },
+        resolveToken,
+      });
+
+      if (verdict.decision === 'invalid_target') {
+        return { success: false, error: 'invalid_target', tokenId: data.tokenId };
+      }
+      if (verdict.decision === 'needs_approval') {
+        return verdict.approval;
+      }
+      // 'rejected' cannot occur for category 'consequence'; 'auto' remains.
+
+      return await this.dataAccess.removeTokenEffect({
+        tokenId: data.tokenId,
+        effect: data.effect,
+      });
+    } catch (error) {
+      throw new Error(
+        `Failed to remove token effect: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

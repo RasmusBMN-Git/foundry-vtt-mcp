@@ -1770,6 +1770,11 @@ async function startBackend(): Promise<void> {
 
                   break;
 
+                case 'remove-token-effect':
+                  result = await tokenManipulationTools.handleRemoveTokenEffect(args);
+
+                  break;
+
                 case 'get-available-conditions':
                   result = await tokenManipulationTools.handleGetAvailableConditions(args);
 

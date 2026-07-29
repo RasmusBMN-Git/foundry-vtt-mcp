@@ -181,6 +181,32 @@ export class TokenManipulationTools {
         },
       },
       {
+        name: 'remove-token-effect',
+        description:
+          'Remove a NAMED ActiveEffect — a spell buff or concentration effect like "Bless", "Shield of Faith", or "Bless (Concentration)" — from a token by effect name (case-insensitive) or exact effect id. This is the complement of toggle-token-condition: use THIS for named spell effects/buffs, and toggle-token-condition for status conditions (Prone, Poisoned, etc.). Removes every matching effect. A no-match name is not an error — it returns notFound:true. Targeting an NPC/monster removes immediately. Targeting the PC returns a needs_approval response (D4) unless trustedMode is set (removing a PC buff is a consequence the DM owns).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tokenId: {
+              type: 'string',
+              description: 'The ID of the token whose ActiveEffect should be removed.',
+            },
+            effect: {
+              type: 'string',
+              description:
+                'The ActiveEffect to remove — its name (case-insensitive, e.g. "Bless") or an exact effect id.',
+            },
+            trustedMode: {
+              type: 'boolean',
+              description:
+                'Set true only when the session header declares trusted mode. Lets a PC-target removal auto-apply instead of returning needs_approval.',
+              default: false,
+            },
+          },
+          required: ['tokenId', 'effect'],
+        },
+      },
+      {
         name: 'get-available-conditions',
         description:
           'Get a list of all available status effects/conditions that can be applied to tokens in the current game system',
@@ -636,6 +662,56 @@ export class TokenManipulationTools {
       this.logger.error('Failed to toggle token condition', error);
       throw new Error(
         `Failed to toggle token condition: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  // T40: remove a named ActiveEffect (spell buff / concentration). NPC target
+  // removes immediately; PC target returns a needs_approval payload (D4) unless
+  // trustedMode is set (category 'consequence', same shape as
+  // toggle-token-condition). Does NOT throw on needs_approval — that is a valid,
+  // defined outcome the DM must act on, not a tool failure.
+  async handleRemoveTokenEffect(args: any): Promise<any> {
+    const schema = z.object({
+      tokenId: z.string(),
+      effect: z.string(),
+      trustedMode: z.boolean().optional().default(false),
+    });
+
+    const { tokenId, effect, trustedMode } = schema.parse(args);
+
+    this.logger.info('Removing token effect', { tokenId, effect, trustedMode });
+
+    try {
+      const result: any = await this.foundryClient.query('foundry-mcp-bridge.remove-token-effect', {
+        tokenId,
+        effect,
+        trustedMode,
+      });
+
+      if (result && result.success === false && result.error === 'invalid_target') {
+        this.logger.warn('remove-token-effect: invalid target', result);
+        throw new Error(`Cannot remove effect: invalid target ${result.tokenId ?? tokenId}`);
+      }
+      if (result && result.status === 'needs_approval') {
+        this.logger.info('remove-token-effect: PC target needs approval', result);
+        return result; // pass the D4 approval-request shape straight through
+      }
+
+      this.logger.debug('Token effect removed', { tokenId, effect, result });
+
+      return {
+        success: true,
+        tokenId,
+        effect,
+        removed: result.removed ?? [],
+        notFound: result.notFound === true,
+        message: result.message,
+      };
+    } catch (error) {
+      this.logger.error('Failed to remove token effect', error);
+      throw new Error(
+        `Failed to remove token effect: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }
