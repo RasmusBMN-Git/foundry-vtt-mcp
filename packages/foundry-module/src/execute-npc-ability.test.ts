@@ -78,6 +78,16 @@ function makeSaveDamageActivity(
   };
 }
 
+// T38: a heal activity (Cure Wounds / Healing Word shape). dnd5e 5.3.3 has NO
+// rollHealing — HealActivity rolls healing through `rollDamage`, tagging the roll
+// `options.type:"healing"`; the heal path reads `.total` off each returned roll.
+function makeHealActivity(opts: { healTotal?: number; healType?: string } = {}) {
+  const { healTotal = 9, healType = 'healing' } = opts;
+  return {
+    rollDamage: vi.fn(async () => [{ total: healTotal, options: { type: healType } }]),
+  };
+}
+
 function attackItem(activity: any, name = 'Scimitar') {
   return {
     id: 'itemA',
@@ -91,6 +101,14 @@ function saveItem(activity: any, name = 'Hold Person') {
     id: 'itemS',
     name,
     system: { activities: { getByType: (t: string) => (t === 'save' ? [activity] : []) } },
+  };
+}
+
+function healItem(activity: any, name = 'Cure Wounds') {
+  return {
+    id: 'itemH',
+    name,
+    system: { activities: { getByType: (t: string) => (t === 'heal' ? [activity] : []) } },
   };
 }
 
@@ -515,8 +533,112 @@ describe('executeNpcAbility — NPC-vs-NPC save-spell auto-resolve (T37)', () =>
   });
 });
 
+describe('executeNpcAbility — NPC healing cast (T38)', () => {
+  it('heals an NPC target through the gated apply path (heal activity → rollDamage)', async () => {
+    const activity = makeHealActivity({ healTotal: 9, healType: 'healing' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Cleric', { item: healItem(activity, 'Cure Wounds') }),
+      npc2: npcToken('npc2', 'Wounded Ally'),
+    });
+    const { da, applySpy } = newDataAccess();
+    applySpy.mockResolvedValueOnce({ hpBefore: 3, hpAfter: 12, success: true } as any);
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Cure Wounds',
+      targetTokenIds: ['npc2'],
+    });
+
+    // dnd5e 5.3.3 heals via rollDamage (NOT rollHealing), dialog fast-forwarded.
+    expect(activity.rollDamage).toHaveBeenCalledWith({}, { configure: false }, { create: true });
+    // Healing routes through the SAME gated HP-write path as damage, as a
+    // type:"healing" entry (applyDamage clamps at max HP) — never a raw write.
+    expect(applySpy).toHaveBeenCalledWith({
+      tokenId: 'npc2',
+      damage: [{ value: 9, type: 'healing' }],
+    });
+    expect(res.activityType).toBe('heal');
+    expect(res.results[0]).toMatchObject({
+      tokenId: 'npc2',
+      tokenName: 'Wounded Ally',
+      healing: 9,
+      decision: 'auto',
+      hpBefore: 3,
+      hpAfter: 12,
+    });
+    expect(res.results[0].healingParts).toEqual([{ value: 9, type: 'healing' }]);
+  });
+
+  it('rolls the healing once and shares it across multiple targets', async () => {
+    const activity = makeHealActivity({ healTotal: 7 });
+    installFoundry({
+      npc1: npcToken('npc1', 'Cleric', { item: healItem(activity, 'Mass Cure Wounds') }),
+      npc2: npcToken('npc2', 'Ally A'),
+      npc3: npcToken('npc3', 'Ally B'),
+    });
+    const { da, applySpy } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Mass Cure Wounds',
+      targetTokenIds: ['npc2', 'npc3'],
+    });
+
+    expect(activity.rollDamage).toHaveBeenCalledOnce();
+    expect(applySpy).toHaveBeenCalledTimes(2);
+    expect(res.results.map((r: any) => r.decision)).toEqual(['auto', 'auto']);
+    expect(res.results.every((r: any) => r.healing === 7)).toBe(true);
+  });
+
+  it('a PC target needs approval when NOT trusted — no auto-heal write (D4)', async () => {
+    const activity = makeHealActivity({ healTotal: 8 });
+    installFoundry({
+      npc1: npcToken('npc1', 'Cleric', { item: healItem(activity, 'Healing Word') }),
+      pc1: pcToken('pc1', 'TestPC'),
+    });
+    const { da, applySpy } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Healing Word',
+      targetTokenIds: ['pc1'],
+    });
+
+    expect(activity.rollDamage).toHaveBeenCalledOnce(); // card/roll still posts
+    expect(applySpy).not.toHaveBeenCalled(); // but no HP write until approved
+    expect(res.results[0]).toMatchObject({ tokenId: 'pc1', decision: 'needs_approval' });
+    expect(res.results[0].approval).toMatchObject({
+      verb: 'npc_heal',
+      target: { token_id: 'pc1', is_pc: true },
+      proposed: { healing: [{ value: 8, type: 'healing' }] },
+    });
+  });
+
+  it('a PC target auto-heals under trusted mode (DM owns the consequence)', async () => {
+    const activity = makeHealActivity({ healTotal: 8 });
+    installFoundry({
+      npc1: npcToken('npc1', 'Cleric', { item: healItem(activity, 'Healing Word') }),
+      pc1: pcToken('pc1', 'TestPC'),
+    });
+    const { da, applySpy } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Healing Word',
+      targetTokenIds: ['pc1'],
+      trustedMode: true,
+    });
+
+    expect(applySpy).toHaveBeenCalledWith({
+      tokenId: 'pc1',
+      damage: [{ value: 8, type: 'healing' }],
+    });
+    expect(res.results[0]).toMatchObject({ tokenId: 'pc1', decision: 'auto' });
+  });
+});
+
 describe('executeNpcAbility — no fireable activity', () => {
-  it('throws when the item has neither an attack nor a save activity', async () => {
+  it('throws when the item has no attack, save, nor heal activity', async () => {
     const item = {
       id: 'itemX',
       name: 'Trinket',
@@ -527,6 +649,6 @@ describe('executeNpcAbility — no fireable activity', () => {
 
     await expect(
       da.executeNpcAbility({ tokenId: 'npc1', itemIdentifier: 'Trinket' })
-    ).rejects.toThrow(/no attack\/save Activity/i);
+    ).rejects.toThrow(/no attack\/save\/heal Activity/i);
   });
 });
