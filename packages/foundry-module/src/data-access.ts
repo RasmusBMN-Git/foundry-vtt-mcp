@@ -8030,8 +8030,22 @@ export class FoundryDataAccess {
 
       let defeatedFlagged = false;
       if (after !== null && after <= 0 && actor.type === 'npc') {
-        const combat = (game as any).combat;
-        const combatant = combat?.combatants?.find((c: any) => c.tokenId === data.tokenId);
+        // Resolve the combatant from whatever combat contains this token — NOT
+        // `game.combat` (the globally-active combat only). Right after
+        // enroll-tokens-in-combat creates a combat, or whenever a stale/empty
+        // combat is the active one, `game.combat` does not yet hold the target's
+        // combatant, so the flag would silently drop even though the NPC really
+        // hit 0 HP (T31-FIX-2, confirmed by live probe 2026-07-29). A token is
+        // normally in <=1 combat, so first match is safe.
+        const combats = (game as any).combats;
+        let combatant: any = null;
+        for (const cb of combats ?? []) {
+          const found = cb.combatants?.find((c: any) => c.tokenId === data.tokenId);
+          if (found) {
+            combatant = found;
+            break;
+          }
+        }
         if (combatant) {
           await combatant.update({ defeated: true });
           if (typeof actor.toggleStatusEffect === 'function') {

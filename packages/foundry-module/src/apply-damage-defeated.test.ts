@@ -63,22 +63,32 @@ function installFoundryGlobals(opts: {
   sceneToken: any;
   combatant?: { tokenId: string; update: ReturnType<typeof vi.fn> };
   combat?: any;
+  // Regression control (T31-FIX-2): the fix scans game.combats, not game.combat.
+  // `combats` overrides the derived list; `activeCombat` overrides game.combat so
+  // a test can model "the token's combat is NOT the globally-active one".
+  combats?: any[];
+  activeCombat?: any;
 }) {
   const scene = {
     tokens: { get: (id: string) => (opts.sceneToken?.id === id ? opts.sceneToken : undefined) },
   };
+
+  const derivedCombat =
+    opts.combat !== undefined
+      ? opts.combat
+      : opts.combatant
+        ? { combatants: { find: (fn: any) => [opts.combatant].find(fn) ?? undefined } }
+        : undefined;
+
+  const combats = opts.combats !== undefined ? opts.combats : derivedCombat ? [derivedCombat] : [];
 
   (globalThis as any).game = {
     ready: true,
     world: { id: 'test-world', setFlag: undefined },
     user: { id: 'gm1', name: 'GM' },
     scenes: { current: scene },
-    combat:
-      opts.combat !== undefined
-        ? opts.combat
-        : opts.combatant
-          ? { combatants: { find: (fn: any) => [opts.combatant].find(fn) ?? undefined } }
-          : undefined,
+    combats,
+    combat: opts.activeCombat !== undefined ? opts.activeCombat : derivedCombat,
   };
 
   (globalThis as any).CONFIG = {
@@ -107,6 +117,39 @@ describe('applyDamageToToken — defeated-flag + heal-arg (T31-FIX)', () => {
     const dal = new FoundryDataAccess();
     const result: any = await dal.applyDamageToToken({
       tokenId: 'npc1',
+      damage: [{ value: 10, type: 'slashing' }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.hpAfter).toBe(0);
+    expect(result.defeatedFlagged).toBe(true);
+    expect(combatant.update).toHaveBeenCalledWith({ defeated: true });
+    expect(actor.toggleStatusEffect).toHaveBeenCalledWith('dead', {
+      active: true,
+      overlay: true,
+    });
+  });
+
+  it('flags an NPC defeated when its combat is NOT the globally-active combat (T31-FIX-2)', async () => {
+    // The live-probe regression: right after enroll creates a combat, game.combat
+    // still points at a stale/empty combat, so the old game.combat-only lookup
+    // missed the combatant and defeatedFlagged silently stayed false.
+    const actor = makeActor({ type: 'npc', hp: 10 });
+    const token = makeToken('npc6', 'Goblin', actor);
+    const combatant = { tokenId: 'npc6', update: vi.fn(async () => {}) };
+    const holdingCombat = {
+      combatants: { find: (fn: any) => [combatant].find(fn) ?? undefined },
+    };
+    const emptyActiveCombat = { combatants: { find: () => undefined } };
+    installFoundryGlobals({
+      sceneToken: token,
+      combats: [emptyActiveCombat, holdingCombat], // token's combat is not first / not active
+      activeCombat: emptyActiveCombat, // game.combat points at the empty one
+    });
+
+    const dal = new FoundryDataAccess();
+    const result: any = await dal.applyDamageToToken({
+      tokenId: 'npc6',
       damage: [{ value: 10, type: 'slashing' }],
     });
 
