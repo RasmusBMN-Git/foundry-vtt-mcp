@@ -8883,10 +8883,13 @@ export class FoundryDataAccess {
       const activities = (item as any).system?.activities;
       const attackActivity = activities?.getByType?.('attack')?.[0];
       const saveActivity = activities?.getByType?.('save')?.[0];
+      // T38: healing spells (Cure Wounds / Healing Word) carry a `heal` activity —
+      // neither attack nor save — so the pre-T38 guard threw for them.
+      const healActivity = activities?.getByType?.('heal')?.[0];
 
-      if (!attackActivity && !saveActivity) {
+      if (!attackActivity && !saveActivity && !healActivity) {
         throw new Error(
-          `Item "${item.name}" has no attack/save Activity to fire (T30a: use-item is not the NPC-ability path)`
+          `Item "${item.name}" has no attack/save/heal Activity to fire (T30a: use-item is not the NPC-ability path)`
         );
       }
 
@@ -9034,6 +9037,126 @@ export class FoundryDataAccess {
           results,
           pcSaveRequested: null,
           chatMessageCreated: attackTotal !== null,
+        };
+      }
+
+      // ── HEAL PATH (T38): NPC casts a healing spell (Cure Wounds / Healing Word) ──
+      // API confirmed by live probe against dnd5e 5.3.3 source (HealActivity):
+      //   • there is NO `rollHealing` method — HealActivity rolls its healing
+      //     through `rollDamage`, which it OVERRIDES only to tag the chat card
+      //     `flags.dnd5e.roll.type:"healing"`. The healing part's own damage type
+      //     is "healing", so each returned roll's `options.type` is "healing" too.
+      //   • `{configure:false}` fast-forwards the roll dialog (same as attack/save).
+      // The HP write reuses the SAME gated path as damage — `applyDamageToToken`
+      // with a `type:"healing"` entry — which dnd5e's `applyDamage` treats as
+      // negative damage clamped at max HP (healing types are excluded from the
+      // resist/immune math; T-INT-confirmed). No manual `system.attributes.hp`
+      // write, so the T31 gate + max cap both hold. A healing spell has no
+      // attacker-vs-target roll: every listed target is healed. PC targets are a
+      // WRITE to PC HP → routed through the same D4 consequence gate as damage
+      // (NPC auto; PC needs_approval unless trusted) — a heal is a consequence the
+      // DM owns, NOT a PC decision (D2), because the DM heals its own ally.
+      // Out of scope (T38 task file): utility/buff spells (Bless, Shield of Faith)
+      // that apply an ActiveEffect via a `utility` activity — a different mechanism.
+      if (healActivity) {
+        if (typeof (healActivity as any).rollDamage !== 'function') {
+          throw new Error(
+            `Heal activity on "${item.name}" has no rollDamage (dnd5e version mismatch)`
+          );
+        }
+
+        const resolveToken = makeLiveTokenResolver();
+        const targetIds = data.targetTokenIds ?? [];
+        const results: any[] = [];
+
+        // Roll the healing once, shared across all listed targets (matches the save
+        // path's shared-damage RAW; a fresh per-target roll is out of scope). A heal
+        // is never a crit.
+        const healRolls = await (healActivity as any).rollDamage(
+          {},
+          { configure: false },
+          { create: true }
+        );
+        const rollsArr = Array.isArray(healRolls) ? healRolls : healRolls ? [healRolls] : [];
+        const healEntries = rollsArr
+          .map((r: any) => ({
+            value: typeof r?.total === 'number' ? r.total : 0,
+            type: r?.options?.type ?? r?.type ?? 'healing',
+          }))
+          .filter((d: any) => d.value > 0);
+        const totalHealing = healEntries.reduce((s: number, d: any) => s + d.value, 0);
+
+        for (const tid of targetIds) {
+          const targetToken = scene.tokens.get(tid);
+          const base: any = {
+            tokenId: tid,
+            tokenName: (targetToken as any)?.name ?? tid,
+            healing: totalHealing,
+            healingParts: healEntries,
+          };
+
+          if (healEntries.length === 0) {
+            // A heal activity with no healing formula (mis-authored item) — nothing
+            // to apply. Card already posted.
+            results.push({ ...base, decision: 'no_healing' });
+            continue;
+          }
+
+          // Route through the T31 gate (category 'consequence'): NPC target auto;
+          // PC target → D4 approval unless trusted mode. Never a raw HP write.
+          const verdict = checkTarget({
+            token_id: tid,
+            verb: 'npc_heal',
+            category: 'consequence',
+            trustedMode: data.trustedMode === true,
+            proposed: { healing: healEntries },
+            resolveToken,
+          });
+
+          if (verdict.decision === 'invalid_target') {
+            results.push({ ...base, decision: 'invalid_target' });
+            continue;
+          }
+          if (verdict.decision === 'needs_approval') {
+            results.push({ ...base, decision: 'needs_approval', approval: verdict.approval });
+            continue;
+          }
+
+          // applyDamageToToken with a type:"healing" entry heals + caps at max HP
+          // natively; hpBefore/hpAfter come straight back from it.
+          const healResult = await this.applyDamageToToken({
+            tokenId: tid,
+            damage: healEntries,
+          });
+          results.push({
+            ...base,
+            decision: 'auto',
+            hpBefore: healResult.hpBefore,
+            hpAfter: healResult.hpAfter,
+          });
+        }
+
+        this.auditLog(
+          'executeNpcAbility',
+          {
+            tokenId: data.tokenId,
+            itemId: item.id,
+            itemName: item.name,
+            targetTokenIds: data.targetTokenIds,
+          },
+          'success'
+        );
+
+        return {
+          success: true,
+          tokenId: token.id,
+          tokenName: token.name,
+          itemName: item.name,
+          activityType: 'heal',
+          targets: targetIds,
+          results,
+          pcSaveRequested: null,
+          chatMessageCreated: healEntries.length > 0,
         };
       }
 
