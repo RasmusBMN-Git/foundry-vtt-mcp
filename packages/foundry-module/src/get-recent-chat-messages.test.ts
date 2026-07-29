@@ -119,6 +119,36 @@ const healingCard = {
   rolls: [new DamageRoll(8, '2d4 + 4', { type: 'healing' })],
 };
 
+// Native death save — flags.dnd5e.roll.type === 'death'.
+const deathSaveCard = {
+  id: 'death1',
+  timestamp: 5500,
+  flavor: 'Death Saving Throw',
+  speaker: { scene: SCENE, actor: 'eee', token: 'fff', alias: 'TestPC' },
+  flags: { dnd5e: { messageType: 'roll', roll: { type: 'death' } } },
+  rolls: [new D20Roll(14, '1d20')],
+};
+
+// FLAG-LESS healing roll — classifier is the flavor field only.
+const healingFlavorCard = {
+  id: 'healF1',
+  timestamp: 5700,
+  flavor: 'Lay on Hands - Healing',
+  speaker: { scene: SCENE, actor: 'ggg', token: 'hhh', alias: 'Paladin' },
+  flags: {},
+  rolls: [new Roll(10, '10')],
+};
+
+// FLAG-LESS death save — flavor contains both "death sav" and "saving throw".
+const deathFlavorCard = {
+  id: 'deathF1',
+  timestamp: 5800,
+  flavor: 'Death Saving Throw (Public)',
+  speaker: { scene: SCENE, actor: 'iii', token: 'jjj', alias: 'TestPC' },
+  flags: {},
+  rolls: [new Roll(9, '1d20')],
+};
+
 const plainTextCard = {
   id: 'text1',
   timestamp: 6000,
@@ -134,6 +164,9 @@ const ALL_CARDS = [
   saveNativeCard,
   saveBridgeCard,
   healingCard,
+  deathSaveCard,
+  healingFlavorCard,
+  deathFlavorCard,
   plainTextCard,
 ];
 
@@ -198,12 +231,36 @@ describe('getRecentChatMessages — classification', () => {
     expect(rec.rollTotal).toBe(13);
   });
 
-  it('buckets a healing card as other but preserves the raw roll type', async () => {
+  it('classifies a native healing card as heal and preserves the raw roll type', async () => {
     const da = new FoundryDataAccess();
     const { messages } = await da.getRecentChatMessages();
     const rec = byId(messages, 'heal1');
-    expect(rec.classification).toBe('other');
+    expect(rec.classification).toBe('heal');
     expect(rec.dnd5eRollType).toBe('healing');
+  });
+
+  it('classifies a native death save off flags.dnd5e.roll.type', async () => {
+    const da = new FoundryDataAccess();
+    const { messages } = await da.getRecentChatMessages();
+    const rec = byId(messages, 'death1');
+    expect(rec.classification).toBe('death');
+    expect(rec.dnd5eRollType).toBe('death');
+  });
+
+  it('classifies a FLAG-LESS healing roll via flavor fallback', async () => {
+    const da = new FoundryDataAccess();
+    const { messages } = await da.getRecentChatMessages();
+    const rec = byId(messages, 'healF1');
+    expect(rec.classification).toBe('heal');
+    expect(rec.dnd5eRollType).toBeNull();
+  });
+
+  it('classifies a FLAG-LESS death save as death, not save, via flavor fallback', async () => {
+    const da = new FoundryDataAccess();
+    const { messages } = await da.getRecentChatMessages();
+    const rec = byId(messages, 'deathF1');
+    expect(rec.classification).toBe('death');
+    expect(rec.dnd5eRollType).toBeNull();
   });
 
   it('classifies a non-roll GM text message as other without crashing', async () => {
@@ -250,7 +307,7 @@ describe('getRecentChatMessages — limit + ordering', () => {
   it('defaults to the last 10, oldest-to-newest', async () => {
     const da = new FoundryDataAccess();
     const { messages } = await da.getRecentChatMessages();
-    expect(messages).toHaveLength(6);
+    expect(messages).toHaveLength(9);
     expect(messages[0].id).toBe('attack1'); // oldest
     expect(messages[messages.length - 1].id).toBe('text1'); // most recent
   });
@@ -258,13 +315,13 @@ describe('getRecentChatMessages — limit + ordering', () => {
   it('honors an explicit limit, returning the most recent N', async () => {
     const da = new FoundryDataAccess();
     const { messages } = await da.getRecentChatMessages({ limit: 2 });
-    expect(messages.map(m => m.id)).toEqual(['heal1', 'text1']);
+    expect(messages.map(m => m.id)).toEqual(['deathF1', 'text1']);
   });
 
   it('clamps limit to the 1..30 range', async () => {
     const da = new FoundryDataAccess();
     expect((await da.getRecentChatMessages({ limit: 0 })).messages).toHaveLength(1);
-    expect((await da.getRecentChatMessages({ limit: 999 })).messages).toHaveLength(6);
+    expect((await da.getRecentChatMessages({ limit: 999 })).messages).toHaveLength(9);
   });
 
   it('returns an empty list (not a crash) when the chat log is empty', async () => {

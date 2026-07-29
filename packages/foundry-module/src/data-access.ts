@@ -263,7 +263,7 @@ interface ChatMessageTargetRecord {
 interface ChatMessageRecord {
   id: string | null;
   timestamp: number | null;
-  classification: 'attack' | 'damage' | 'save' | 'other';
+  classification: 'attack' | 'damage' | 'save' | 'heal' | 'death' | 'other';
   dnd5eRollType: string | null; // raw flags.dnd5e.roll.type ('healing' etc.)
   flavor: string | null;
   speaker: { actor: string | null; token: string | null; alias: string | null };
@@ -3870,14 +3870,20 @@ export class FoundryDataAccess {
     const rolls: any[] = Array.isArray(m?.rolls) ? m.rolls : [];
     const isRoll = rolls.length > 0;
 
-    let classification: 'attack' | 'damage' | 'save' | 'other' = 'other';
+    let classification: 'attack' | 'damage' | 'save' | 'heal' | 'death' | 'other' = 'other';
     if (d5eRollType === 'attack' || d5eRollType === 'damage' || d5eRollType === 'save') {
       classification = d5eRollType;
+    } else if (d5eRollType === 'healing') {
+      classification = 'heal';
+    } else if (d5eRollType === 'death') {
+      classification = 'death';
     } else if (!d5eRollType && isRoll) {
       const f = String(m?.flavor ?? '').toLowerCase();
-      if (/saving throw/.test(f)) classification = 'save';
+      if (/death sav/.test(f)) classification = 'death';
+      else if (/saving throw/.test(f)) classification = 'save';
       else if (/attack/.test(f)) classification = 'attack';
       else if (/damage/.test(f)) classification = 'damage';
+      else if (/healing|heals?\b/.test(f)) classification = 'heal';
     }
 
     const rollRecords: ChatRollRecord[] = rolls.map(r => ({
