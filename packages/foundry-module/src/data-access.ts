@@ -8887,6 +8887,32 @@ export class FoundryDataAccess {
   }
 
   /**
+   * T39 — is the attacker within 5 ft (≤ 1 grid square) of the target?
+   *
+   * Uses the native grid primitive `canvas.grid.measurePath` (Foundry v12+)
+   * between the two token centers — NO hand-rolled grid geometry (CLAUDE.md
+   * off-limits). Prefers the integer `spaces` (grid cells traversed, so
+   * diagonal-adjacent counts as 1 regardless of the diagonal rule); falls back
+   * to `distance` (scene units) vs the scene's per-cell distance. If the native
+   * primitive is unavailable it returns false (fail-soft: no forced crit) — it
+   * never guesses a distance.
+   */
+  private isWithinFiveFeet(scene: any, attacker: any, target: any): boolean {
+    const grid = (globalThis as any).canvas?.grid;
+    if (!grid || typeof grid.measurePath !== 'function') return false;
+    const gridSize = scene?.grid?.size ?? 100;
+    const gridDistance = scene?.grid?.distance ?? 5;
+    const centerOf = (t: any) => ({
+      x: (t?.x ?? 0) + ((t?.width ?? 1) * gridSize) / 2,
+      y: (t?.y ?? 0) + ((t?.height ?? 1) * gridSize) / 2,
+    });
+    const res = grid.measurePath([centerOf(attacker), centerOf(target)]);
+    if (typeof res?.spaces === 'number') return res.spaces <= 1;
+    if (typeof res?.distance === 'number') return res.distance <= gridDistance;
+    return false;
+  }
+
+  /**
    * T33 (+ T33-FIX) — fire an NPC's attack/spell, fast-forwarding every dialog.
    *
    * Attack activities fire `attackActivity.rollAttack({}, {configure:false},
@@ -9007,6 +9033,9 @@ export class FoundryDataAccess {
         // always hits + crits; a natural 1 always misses.
         const isCrit = attackRoll?.isCritical === true;
         const isFumble = attackRoll?.isFumble === true;
+        // T39: only a MELEE attack can auto-crit vs an incapacitated adjacent
+        // target. dnd5e stores the melee/ranged flag at attack.type.value.
+        const attackIsMelee = (attackActivity as any).attack?.type?.value === 'melee';
 
         const resolveToken = makeLiveTokenResolver();
         const targetIds = data.targetTokenIds ?? [];
@@ -9031,7 +9060,24 @@ export class FoundryDataAccess {
             continue;
           }
 
-          // Roll damage (crit flag from the natural 20), no dialog.
+          // T39: a MELEE hit from within 5 ft against an unconscious/paralyzed
+          // target is an automatic critical (RAW). The shared d20's natural-20
+          // crit (isCrit) still applies to every target; this ADDS the
+          // incapacitated-adjacent case, computed per target. Ranged attacks,
+          // out-of-range attackers, and conscious targets are unchanged. The
+          // `&&` chain short-circuits so distance is measured only for a melee
+          // hit on an incapacitated target. (Advantage on the attack d20 is
+          // deferred — the model rolls one shared d20 for all targets; see T39.)
+          const targetIncapacitated =
+            (targetActor as any)?.statuses?.has?.('unconscious') === true ||
+            (targetActor as any)?.statuses?.has?.('paralyzed') === true;
+          const autoCrit =
+            attackIsMelee &&
+            targetIncapacitated &&
+            this.isWithinFiveFeet(scene, token, targetToken);
+          const effectiveCrit = isCrit || autoCrit;
+
+          // Roll damage (crit flag: natural 20 OR the T39 auto-crit), no dialog.
           // T-BUG-multiplyNumeric (2026-07-20): dnd5e 5.x's damage process-config
           // key is `isCritical` (boolean), NOT `critical`. A boolean under `critical`
           // survives `DamageRoll.build`'s `config.critical ??= {}` guard and then
@@ -9041,7 +9087,7 @@ export class FoundryDataAccess {
           // `config.critical` undefined so build() creates the {}. Matches dnd5e's
           // own AttackActivity.#rollDamage handler.
           const damageRolls = await attackActivity.rollDamage(
-            { isCritical: isCrit },
+            { isCritical: effectiveCrit },
             { configure: false },
             { create: true }
           );
@@ -9061,7 +9107,7 @@ export class FoundryDataAccess {
           const hitBase = {
             ...base,
             hit: true,
-            crit: isCrit,
+            crit: effectiveCrit,
             damage: totalDamage,
             damageParts: damageEntries,
           };
