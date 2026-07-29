@@ -32,6 +32,9 @@ function makeAttackActivity(
     isFumble: boolean;
     damageTotal: number;
     damageType: string;
+    // T39: dnd5e stores the melee/ranged flag at attack.type.value. Only a
+    // melee attack can auto-crit vs an incapacitated adjacent target.
+    attackType: string;
   }> = {}
 ) {
   const {
@@ -40,10 +43,11 @@ function makeAttackActivity(
     isFumble = false,
     damageTotal = 7,
     damageType = 'slashing',
+    attackType = 'melee',
   } = overrides;
   const rollAttack = vi.fn(async () => [{ total: attackTotal, isCritical, isFumble }]);
   const rollDamage = vi.fn(async () => [{ total: damageTotal, options: { type: damageType } }]);
-  return { rollAttack, rollDamage };
+  return { rollAttack, rollDamage, attack: { type: { value: attackType } } };
 }
 
 function makeSaveActivity(ability = 'wis') {
@@ -115,14 +119,29 @@ function healItem(activity: any, name = 'Cure Wounds') {
 function npcToken(
   id: string,
   name: string,
-  opts: { ac?: number; item?: any; saveTotal?: number } = {}
+  // T39: `x`/`y` (grid pixels) + `statuses` let a test place a token adjacent to
+  // an incapacitated target for the auto-crit path. Defaults keep every prior
+  // test unchanged (position 0,0; no statuses → not incapacitated).
+  opts: {
+    ac?: number;
+    item?: any;
+    saveTotal?: number;
+    x?: number;
+    y?: number;
+    statuses?: string[];
+  } = {}
 ) {
   return {
     id,
     name,
+    x: opts.x ?? 0,
+    y: opts.y ?? 0,
+    width: 1,
+    height: 1,
     actor: {
       name,
       hasPlayerOwner: false,
+      statuses: new Set<string>(opts.statuses ?? []),
       system: { attributes: { ac: { value: opts.ac ?? 12 }, hp: { value: 20 } } },
       items: opts.item ? [opts.item] : [],
       applyDamage: vi.fn(),
@@ -149,8 +168,14 @@ function pcToken(id: string, name: string, opts: { ac?: number; item?: any } = {
   };
 }
 
+const GRID_SIZE = 100;
+
 function installFoundry(tokens: Record<string, any>) {
-  const scene = { id: 's1', tokens: { get: (id: string) => tokens[id] ?? null } };
+  const scene = {
+    id: 's1',
+    grid: { size: GRID_SIZE, distance: 5 },
+    tokens: { get: (id: string) => tokens[id] ?? null },
+  };
   // FoundryDataAccess' constructor builds a PersistentCreatureIndex that
   // registers Foundry Hooks — stub them so construction doesn't throw.
   (globalThis as any).Hooks = { on: vi.fn(), off: vi.fn(), once: vi.fn() };
@@ -164,6 +189,18 @@ function installFoundry(tokens: Record<string, any>) {
     tokens: {
       get: (id: string) => tokens[id] ?? null,
       setTargets: vi.fn(),
+    },
+    // T39: faithful stand-in for the native canvas.grid.measurePath — Chebyshev
+    // cell count between two points (5e default diagonal = 1 space), which is
+    // what isWithinFiveFeet reads as `spaces`.
+    grid: {
+      measurePath: (waypoints: Array<{ x: number; y: number }>) => {
+        const [a, b] = waypoints;
+        const dxCells = Math.round(Math.abs(a.x - b.x) / GRID_SIZE);
+        const dyCells = Math.round(Math.abs(a.y - b.y) / GRID_SIZE);
+        const spaces = Math.max(dxCells, dyCells);
+        return { spaces, distance: spaces * 5 };
+      },
     },
   };
   return scene;
@@ -287,6 +324,142 @@ describe('executeNpcAbility — attack path fast-forward (T33-FIX)', () => {
       { create: true }
     );
     expect(applySpy).toHaveBeenCalledOnce();
+  });
+});
+
+describe('executeNpcAbility — auto-crit vs an incapacitated adjacent target (T39)', () => {
+  it('a MELEE hit within 5 ft on an unconscious target auto-crits (damage rolled isCritical:true)', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'melee' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Downed Ally', {
+        ac: 12,
+        x: 100,
+        y: 0,
+        statuses: ['unconscious'],
+      }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Scimitar',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(res.results[0].hit).toBe(true);
+    expect(res.results[0].crit).toBe(true);
+    // The auto-crit drives the doubled-dice flag on the real DamageRoll.
+    expect(activity.rollDamage).toHaveBeenCalledWith(
+      { isCritical: true },
+      { configure: false },
+      { create: true }
+    );
+  });
+
+  it('a PARALYZED adjacent target also auto-crits on a melee hit (diagonal cell)', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'melee' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity), x: 0, y: 0 }),
+      // one cell down AND one cell right → diagonal-adjacent = 1 space (5e default).
+      npc2: npcToken('npc2', 'Held Foe', {
+        ac: 12,
+        x: 100,
+        y: 100,
+        statuses: ['paralyzed'],
+      }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Scimitar',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(res.results[0].crit).toBe(true);
+    expect(activity.rollDamage).toHaveBeenCalledWith(
+      { isCritical: true },
+      { configure: false },
+      { create: true }
+    );
+  });
+
+  it('the same unconscious target at 2 squares (10 ft) does NOT force a crit', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'melee' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Downed Ally', {
+        ac: 12,
+        x: 200,
+        y: 0,
+        statuses: ['unconscious'],
+      }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Scimitar',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(res.results[0].hit).toBe(true);
+    expect(res.results[0].crit).toBe(false);
+    expect(activity.rollDamage).toHaveBeenCalledWith(
+      { isCritical: false },
+      { configure: false },
+      { create: true }
+    );
+  });
+
+  it('a CONSCIOUS adjacent target does NOT force a crit', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'melee' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Orc', { ac: 12, x: 100, y: 0 }), // no statuses
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Scimitar',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(res.results[0].crit).toBe(false);
+    expect(activity.rollDamage).toHaveBeenCalledWith(
+      { isCritical: false },
+      { configure: false },
+      { create: true }
+    );
+  });
+
+  it('a RANGED attack on an adjacent unconscious target does NOT force a crit', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'ranged' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Archer', { item: attackItem(activity, 'Shortbow'), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Downed Ally', {
+        ac: 12,
+        x: 100,
+        y: 0,
+        statuses: ['unconscious'],
+      }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Shortbow',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(res.results[0].crit).toBe(false);
+    expect(activity.rollDamage).toHaveBeenCalledWith(
+      { isCritical: false },
+      { configure: false },
+      { create: true }
+    );
   });
 });
 
