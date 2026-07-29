@@ -9071,6 +9071,181 @@ export class FoundryDataAccess {
         { create: true }
       );
 
+      // ── NPC-target auto-resolve (T37) ──────────────────────────────────────
+      // The card above still hands a PC's save to the PLAYER (D2, loop above);
+      // this resolves NPC targets NPC-vs-NPC the way the attack path resolves a
+      // hit. Before T37 the save path posted the card and stopped, so an NPC
+      // target of e.g. Sacred Flame took no save and no damage.
+      //
+      // Save API confirmed against the dnd5e 5.3.3 source (BaseSaveActivityData):
+      //   • effective DC   = saveActivity.save.dc.value  (computed at prepareFinalData)
+      //   • target ability = saveActivity.save.ability.first()  (a Set) — NOT the
+      //     `.ability` getter, which returns the DC-calc/caster ability, not the
+      //     ability the TARGET rolls.
+      //   • onSave         = saveActivity.damage.onSave ∈ none|half|full
+      //     (default "half"; "none" for cantrips like Sacred Flame — a made save
+      //     takes zero, not half).
+      // Damage is rolled ONCE and shared across targets (RAW for area saves): full
+      // on a failed save, the `onSave` amount on a success, halved via the native
+      // applyDamage multiplier so per-type resistances still apply. Every write
+      // routes through the T31 consequence gate → applyDamageToToken (NPC → auto),
+      // never a raw HP write. Non-damage save spells (Hold Person) still post + roll
+      // the save and report it; applying the on-fail EFFECT is out of scope for T37.
+      const saveResults: any[] = [];
+      if (data.targetTokenIds?.length) {
+        const resolveToken = makeLiveTokenResolver();
+
+        const saveDc = (saveActivity as any).save?.dc;
+        const dc: number | null =
+          typeof saveDc?.value === 'number'
+            ? saveDc.value
+            : typeof saveDc === 'number'
+              ? saveDc
+              : null;
+
+        const abilityRaw = (saveActivity as any).save?.ability;
+        const saveAbility: string = Array.isArray(abilityRaw)
+          ? abilityRaw[0]
+          : abilityRaw instanceof Set
+            ? [...abilityRaw][0]
+            : typeof abilityRaw?.first === 'function'
+              ? abilityRaw.first()
+              : (abilityRaw ?? 'con');
+
+        const onSave: string = (saveActivity as any).damage?.onSave ?? 'half';
+
+        // Roll the spell's damage once (shared across all targets), only if it has
+        // damage parts. Same array shape the attack path consumes; a save is never
+        // a crit.
+        let damageEntries: Array<{ value: number; type: string }> = [];
+        let totalDamage = 0;
+        if ((saveActivity as any).damage?.parts?.length) {
+          const damageRolls = await (saveActivity as any).rollDamage(
+            {},
+            { configure: false },
+            { create: true }
+          );
+          const rollsArr = Array.isArray(damageRolls)
+            ? damageRolls
+            : damageRolls
+              ? [damageRolls]
+              : [];
+          damageEntries = rollsArr
+            .map((r: any) => ({
+              value: typeof r?.total === 'number' ? r.total : 0,
+              type: r?.options?.type ?? r?.type ?? 'untyped',
+            }))
+            .filter((d: any) => d.value > 0);
+          totalDamage = damageEntries.reduce((s: number, d: any) => s + d.value, 0);
+        }
+
+        for (const tid of data.targetTokenIds) {
+          const resolved = resolveToken(tid);
+          // PC targets are the player's save (D2) — already handed off above and
+          // never auto-damaged here (the player rolls; the DM applies the
+          // consequence out of band). Record and skip.
+          if (resolved?.isPC) {
+            saveResults.push({
+              tokenId: tid,
+              tokenName: resolved.name ?? tid,
+              dc,
+              decision: 'pc_save_requested',
+            });
+            continue;
+          }
+
+          const targetToken = scene.tokens.get(tid);
+          const targetActor = (targetToken as any)?.actor;
+          const targetBase: any = {
+            tokenId: tid,
+            tokenName: (targetToken as any)?.name ?? resolved?.name ?? tid,
+            dc,
+            onSave,
+          };
+
+          if (!targetActor || typeof targetActor.rollSavingThrow !== 'function') {
+            saveResults.push({ ...targetBase, decision: 'no_save_actor' });
+            continue;
+          }
+
+          // Roll the NPC's save with no dialog (the proven resolveSaveEndsCondition
+          // pattern) and compare against the effective DC.
+          const saveRolls = await targetActor.rollSavingThrow(
+            { ability: saveAbility },
+            { configure: false },
+            { create: true }
+          );
+          const saveRoll = Array.isArray(saveRolls) ? saveRolls[0] : saveRolls;
+          const saveTotal: number | null =
+            typeof saveRoll?.total === 'number' ? saveRoll.total : null;
+          const saveSucceeded = saveTotal !== null && dc !== null ? saveTotal >= dc : false;
+
+          // Multiplier off the save result: fail → full; success → onSave amount.
+          let multiplier = 1;
+          if (saveSucceeded) {
+            multiplier = onSave === 'none' ? 0 : onSave === 'full' ? 1 : 0.5;
+          }
+
+          const hitBase = {
+            ...targetBase,
+            saveTotal,
+            saveSucceeded,
+            damage: totalDamage,
+            damageParts: damageEntries,
+            multiplier,
+          };
+
+          if (damageEntries.length === 0) {
+            // A pure condition/utility save (no damage parts). Save rolled +
+            // reported; effect application is out of T37 scope.
+            saveResults.push({ ...hitBase, decision: 'no_damage' });
+            continue;
+          }
+          if (multiplier === 0) {
+            // Saved against a cantrip / onSave:none — no damage lands.
+            saveResults.push({ ...hitBase, decision: 'save_no_damage' });
+            continue;
+          }
+
+          // Route through the T31 gate (category 'consequence'). NPC → auto; PCs
+          // are pre-skipped above, so this only sees NPC/invalid targets — never a
+          // raw HP write.
+          const verdict = checkTarget({
+            token_id: tid,
+            verb: 'npc_save_damage',
+            category: 'consequence',
+            trustedMode: data.trustedMode === true,
+            proposed: { damage: damageEntries, multiplier },
+            resolveToken,
+          });
+
+          if (verdict.decision === 'invalid_target') {
+            saveResults.push({ ...hitBase, decision: 'invalid_target' });
+            continue;
+          }
+          if (verdict.decision === 'needs_approval') {
+            saveResults.push({
+              ...hitBase,
+              decision: 'needs_approval',
+              approval: verdict.approval,
+            });
+            continue;
+          }
+
+          const dmgResult = await this.applyDamageToToken({
+            tokenId: tid,
+            damage: damageEntries,
+            multiplier,
+          });
+          saveResults.push({
+            ...hitBase,
+            decision: 'auto',
+            hpBefore: dmgResult.hpBefore,
+            hpAfter: dmgResult.hpAfter,
+          });
+        }
+      }
+
       this.auditLog(
         'executeNpcAbility',
         {
@@ -9090,6 +9265,7 @@ export class FoundryDataAccess {
         activityType: 'save',
         targets: data.targetTokenIds ?? [],
         pcSaveRequested,
+        results: saveResults,
         chatMessageCreated: !!chatResult,
       };
     } catch (error) {

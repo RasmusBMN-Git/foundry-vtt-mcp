@@ -50,6 +50,34 @@ function makeSaveActivity(ability = 'wis') {
   return { save: { ability }, use: vi.fn(async () => ({ id: 'msg1' })) };
 }
 
+// T37: a save activity that also deals damage (Sacred Flame / Fireball shape).
+// `save.ability` is a Set in dnd5e 5.x; the code accepts a Set/array/string, so
+// an array is the simplest faithful mock. `save.dc.value` is the effective DC
+// (computed at prepareFinalData live). `damage.onSave` ∈ none|half|full.
+function makeSaveDamageActivity(
+  opts: {
+    ability?: string;
+    dc?: number;
+    onSave?: string;
+    damageTotal?: number;
+    damageType?: string;
+  } = {}
+) {
+  const {
+    ability = 'dex',
+    dc = 13,
+    onSave = 'none',
+    damageTotal = 8,
+    damageType = 'radiant',
+  } = opts;
+  return {
+    save: { ability: [ability], dc: { value: dc } },
+    damage: { onSave, parts: [{ types: [damageType] }] },
+    use: vi.fn(async () => ({ id: 'msgS' })),
+    rollDamage: vi.fn(async () => [{ total: damageTotal, options: { type: damageType } }]),
+  };
+}
+
 function attackItem(activity: any, name = 'Scimitar') {
   return {
     id: 'itemA',
@@ -66,7 +94,11 @@ function saveItem(activity: any, name = 'Hold Person') {
   };
 }
 
-function npcToken(id: string, name: string, opts: { ac?: number; item?: any } = {}) {
+function npcToken(
+  id: string,
+  name: string,
+  opts: { ac?: number; item?: any; saveTotal?: number } = {}
+) {
   return {
     id,
     name,
@@ -76,6 +108,8 @@ function npcToken(id: string, name: string, opts: { ac?: number; item?: any } = 
       system: { attributes: { ac: { value: opts.ac ?? 12 }, hp: { value: 20 } } },
       items: opts.item ? [opts.item] : [],
       applyDamage: vi.fn(),
+      // T37: NPC-vs-NPC save resolution rolls the target's own save.
+      rollSavingThrow: vi.fn(async () => [{ total: opts.saveTotal ?? 10 }]),
     },
   };
 }
@@ -90,6 +124,9 @@ function pcToken(id: string, name: string, opts: { ac?: number; item?: any } = {
       system: { attributes: { ac: { value: opts.ac ?? 15 }, hp: { value: 30 } } },
       items: opts.item ? [opts.item] : [],
       applyDamage: vi.fn(),
+      // D2: a PC's save is ALWAYS rolled by the player. This spy exists only so a
+      // test can assert the save path NEVER calls it for a PC target.
+      rollSavingThrow: vi.fn(async () => [{ total: 99 }]),
     },
   };
 }
@@ -310,6 +347,171 @@ describe('executeNpcAbility — save activity (D2, unchanged)', () => {
     expect(res.pcSaveRequested).toEqual({ targetName: 'TestPC', ability: 'wis' });
     expect(activity.use).toHaveBeenCalledWith({}, { configure: false }, { create: true });
     expect(applySpy).not.toHaveBeenCalled(); // saves never route to auto-damage
+  });
+});
+
+describe('executeNpcAbility — NPC-vs-NPC save-spell auto-resolve (T37)', () => {
+  it('a FAILING NPC save applies FULL damage through the gated apply path', async () => {
+    const activity = makeSaveDamageActivity({
+      ability: 'dex',
+      dc: 13,
+      onSave: 'none',
+      damageTotal: 8,
+      damageType: 'radiant',
+    });
+    const orc = npcToken('npc2', 'Orc', { saveTotal: 10 }); // 10 < 13 → fails
+    installFoundry({
+      npc1: npcToken('npc1', 'Cultist', { item: saveItem(activity, 'Sacred Flame') }),
+      npc2: orc,
+    });
+    const { da, applySpy } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Sacred Flame',
+      targetTokenIds: ['npc2'],
+    });
+
+    // The target rolls ITS OWN save (DEX), no dialog.
+    expect(orc.actor.rollSavingThrow).toHaveBeenCalledWith(
+      { ability: 'dex' },
+      { configure: false },
+      { create: true }
+    );
+    // Failed save → full damage via the gated path (multiplier 1), never a raw write.
+    expect(applySpy).toHaveBeenCalledWith({
+      tokenId: 'npc2',
+      damage: [{ value: 8, type: 'radiant' }],
+      multiplier: 1,
+    });
+    const r = res.results[0];
+    expect(r).toMatchObject({
+      tokenId: 'npc2',
+      tokenName: 'Orc',
+      saveTotal: 10,
+      dc: 13,
+      saveSucceeded: false,
+      damage: 8,
+      onSave: 'none',
+      multiplier: 1,
+      decision: 'auto',
+      hpBefore: 20,
+      hpAfter: 13,
+    });
+    expect(r.damageParts).toEqual([{ value: 8, type: 'radiant' }]);
+  });
+
+  it('a MADE save vs a cantrip (onSave:none) applies NO damage', async () => {
+    const activity = makeSaveDamageActivity({ dc: 13, onSave: 'none', damageTotal: 8 });
+    const orc = npcToken('npc2', 'Orc', { saveTotal: 18 }); // 18 >= 13 → succeeds
+    installFoundry({
+      npc1: npcToken('npc1', 'Cultist', { item: saveItem(activity, 'Sacred Flame') }),
+      npc2: orc,
+    });
+    const { da, applySpy } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Sacred Flame',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(orc.actor.rollSavingThrow).toHaveBeenCalledOnce();
+    expect(applySpy).not.toHaveBeenCalled();
+    expect(res.results[0]).toMatchObject({
+      saveSucceeded: true,
+      multiplier: 0,
+      decision: 'save_no_damage',
+    });
+  });
+
+  it('a MADE save vs onSave:half applies HALF via the applyDamage multiplier (types preserved)', async () => {
+    const activity = makeSaveDamageActivity({ dc: 13, onSave: 'half', damageTotal: 10 });
+    const orc = npcToken('npc2', 'Orc', { saveTotal: 18 }); // succeeds
+    installFoundry({
+      npc1: npcToken('npc1', 'Mage', { item: saveItem(activity, 'Fireball') }),
+      npc2: orc,
+    });
+    const { da, applySpy } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Fireball',
+      targetTokenIds: ['npc2'],
+    });
+
+    // Half is the native applyDamage multiplier (0.5) — NOT a pre-floored total —
+    // so per-type resistances still apply downstream.
+    expect(applySpy).toHaveBeenCalledWith({
+      tokenId: 'npc2',
+      damage: [{ value: 10, type: 'radiant' }],
+      multiplier: 0.5,
+    });
+    expect(res.results[0]).toMatchObject({
+      saveSucceeded: true,
+      multiplier: 0.5,
+      decision: 'auto',
+    });
+  });
+
+  it('a PC target still routes to the player handoff — never auto-damaged, never auto-rolled (D2)', async () => {
+    const activity = makeSaveDamageActivity({ ability: 'dex', dc: 13, damageTotal: 8 });
+    const pc = pcToken('pc1', 'TestPC');
+    installFoundry({
+      npc1: npcToken('npc1', 'Cultist', { item: saveItem(activity, 'Sacred Flame') }),
+      pc1: pc,
+    });
+    const { da, applySpy, saveReqSpy } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Sacred Flame',
+      targetTokenIds: ['pc1'],
+      trustedMode: true, // even under trusted mode a PC save is the player's (D2)
+    });
+
+    expect(saveReqSpy).toHaveBeenCalledOnce();
+    expect(applySpy).not.toHaveBeenCalled();
+    expect(pc.actor.rollSavingThrow).not.toHaveBeenCalled();
+    expect(res.results[0]).toMatchObject({ tokenId: 'pc1', decision: 'pc_save_requested' });
+  });
+
+  it('a mixed NPC+PC target list resolves per-target and rolls spell damage once', async () => {
+    const activity = makeSaveDamageActivity({
+      ability: 'dex',
+      dc: 13,
+      onSave: 'half',
+      damageTotal: 8,
+    });
+    const orc = npcToken('npc2', 'Orc', { saveTotal: 5 }); // fails → full
+    const pc = pcToken('pc1', 'TestPC');
+    installFoundry({
+      npc1: npcToken('npc1', 'Mage', { item: saveItem(activity, 'Fireball') }),
+      npc2: orc,
+      pc1: pc,
+    });
+    const { da, applySpy, saveReqSpy } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Fireball',
+      targetTokenIds: ['npc2', 'pc1'],
+    });
+
+    // Damage rolled once and shared (RAW for area saves).
+    expect(activity.rollDamage).toHaveBeenCalledOnce();
+    // NPC auto-applied (failed save → full), PC handed off with no auto-damage.
+    expect(applySpy).toHaveBeenCalledTimes(1);
+    expect(applySpy).toHaveBeenCalledWith({
+      tokenId: 'npc2',
+      damage: [{ value: 8, type: 'radiant' }],
+      multiplier: 1,
+    });
+    expect(saveReqSpy).toHaveBeenCalledOnce();
+    expect(pc.actor.rollSavingThrow).not.toHaveBeenCalled();
+    const byId = Object.fromEntries(res.results.map((r: any) => [r.tokenId, r]));
+    expect(byId.npc2.decision).toBe('auto');
+    expect(byId.pc1.decision).toBe('pc_save_requested');
   });
 });
 
