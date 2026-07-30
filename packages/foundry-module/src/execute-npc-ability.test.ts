@@ -28,6 +28,12 @@ import { FoundryDataAccess } from './data-access.js';
 function makeAttackActivity(
   overrides: Partial<{
     attackTotal: number;
+    // T42: total the mock returns when rollAttack is called WITH advantage
+    // (dnd5e reads a top-level `{advantage:true}` on the process config).
+    // Defaults to attackTotal, so pre-T42 tests are unaffected; a mixed-target
+    // test sets it to make the incapacitated target's advantage roll land while
+    // a conscious target's flat roll misses.
+    advantageTotal: number;
     isCritical: boolean;
     isFumble: boolean;
     damageTotal: number;
@@ -39,13 +45,19 @@ function makeAttackActivity(
 ) {
   const {
     attackTotal = 18,
+    advantageTotal,
     isCritical = false,
     isFumble = false,
     damageTotal = 7,
     damageType = 'slashing',
     attackType = 'melee',
   } = overrides;
-  const rollAttack = vi.fn(async () => [{ total: attackTotal, isCritical, isFumble }]);
+  // T42: the d20 is rolled per target now, so the mock returns the advantage
+  // total when the call carries `{advantage:true}` and the flat total otherwise.
+  const rollAttack = vi.fn(async (config: any = {}) => {
+    const total = config?.advantage ? (advantageTotal ?? attackTotal) : attackTotal;
+    return [{ total, isCritical, isFumble }];
+  });
   const rollDamage = vi.fn(async () => [{ total: damageTotal, options: { type: damageType } }]);
   return { rollAttack, rollDamage, attack: { type: { value: attackType } } };
 }
@@ -457,6 +469,146 @@ describe('executeNpcAbility — auto-crit vs an incapacitated adjacent target (T
     expect(res.results[0].crit).toBe(false);
     expect(activity.rollDamage).toHaveBeenCalledWith(
       { isCritical: false },
+      { configure: false },
+      { create: true }
+    );
+  });
+});
+
+describe('executeNpcAbility — advantage vs an incapacitated target (T42)', () => {
+  const ADV_CALL = [{ advantage: true }, { configure: false }, { create: true }];
+  const FLAT_CALL = [{}, { configure: false }, { create: true }];
+
+  it('rolls the attack d20 WITH advantage vs an unconscious target', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'melee' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Downed Ally', { ac: 12, x: 300, y: 0, statuses: ['unconscious'] }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Scimitar',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(activity.rollAttack).toHaveBeenCalledWith(...ADV_CALL);
+    expect(res.results[0].advantage).toBe(true);
+    expect(res.results[0].hit).toBe(true);
+  });
+
+  it('rolls WITH advantage vs a paralyzed target', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'melee' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Held Foe', { ac: 12, x: 300, y: 0, statuses: ['paralyzed'] }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Scimitar',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(activity.rollAttack).toHaveBeenCalledWith(...ADV_CALL);
+    expect(res.results[0].advantage).toBe(true);
+  });
+
+  it('rolls a FLAT d20 (no advantage) vs a conscious target', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'melee' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Orc', { ac: 12, x: 300, y: 0 }), // no statuses
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Scimitar',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(activity.rollAttack).toHaveBeenCalledWith(...FLAT_CALL);
+    expect(res.results[0].advantage).toBe(false);
+  });
+
+  it('a RANGED attack on an unconscious target DOES get advantage (unlike auto-crit)', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'ranged' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Archer', { item: attackItem(activity, 'Shortbow'), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Downed Ally', { ac: 12, x: 100, y: 0, statuses: ['unconscious'] }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Shortbow',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(activity.rollAttack).toHaveBeenCalledWith(...ADV_CALL);
+    expect(res.results[0].advantage).toBe(true);
+    // T42 grants advantage; T39 auto-crit is melee-only, so a ranged hit is NOT a crit.
+    expect(res.results[0].crit).toBe(false);
+  });
+
+  it('a mixed list rolls each target its own d20: advantage for the incapacitated, flat for the conscious', async () => {
+    // Advantage roll (25) hits the unconscious target; the flat roll (8) misses
+    // the conscious one — proving the two targets get separate rolls.
+    const activity = makeAttackActivity({
+      attackTotal: 8,
+      advantageTotal: 25,
+      attackType: 'ranged', // ranged so the outcome turns on advantage, not auto-crit
+    });
+    installFoundry({
+      npc1: npcToken('npc1', 'Archer', { item: attackItem(activity, 'Shortbow'), x: 0, y: 0 }),
+      unc: npcToken('unc', 'Downed Ally', { ac: 12, x: 300, y: 0, statuses: ['unconscious'] }),
+      con: npcToken('con', 'Orc', { ac: 12, x: 300, y: 300 }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Shortbow',
+      targetTokenIds: ['unc', 'con'],
+    });
+
+    // One d20 per target — not one shared roll.
+    expect(activity.rollAttack).toHaveBeenCalledTimes(2);
+    expect(activity.rollAttack).toHaveBeenNthCalledWith(1, ...ADV_CALL);
+    expect(activity.rollAttack).toHaveBeenNthCalledWith(2, ...FLAT_CALL);
+
+    const unc = res.results.find((r: any) => r.tokenId === 'unc');
+    const con = res.results.find((r: any) => r.tokenId === 'con');
+    expect(unc.advantage).toBe(true);
+    expect(unc.hit).toBe(true); // 25 vs AC 12
+    expect(unc.attackTotal).toBe(25);
+    expect(con.advantage).toBe(false);
+    expect(con.hit).toBe(false); // 8 vs AC 12
+    expect(con.attackTotal).toBe(8);
+  });
+
+  it('a melee-adjacent incapacitated target gets advantage AND auto-crit together', async () => {
+    const activity = makeAttackActivity({ attackTotal: 18, attackType: 'melee' });
+    installFoundry({
+      npc1: npcToken('npc1', 'Goblin', { item: attackItem(activity), x: 0, y: 0 }),
+      npc2: npcToken('npc2', 'Downed Ally', { ac: 12, x: 100, y: 0, statuses: ['unconscious'] }),
+    });
+    const { da } = newDataAccess();
+
+    const res = await da.executeNpcAbility({
+      tokenId: 'npc1',
+      itemIdentifier: 'Scimitar',
+      targetTokenIds: ['npc2'],
+    });
+
+    expect(activity.rollAttack).toHaveBeenCalledWith(...ADV_CALL);
+    expect(res.results[0].advantage).toBe(true);
+    expect(res.results[0].crit).toBe(true);
+    expect(activity.rollDamage).toHaveBeenCalledWith(
+      { isCritical: true },
       { configure: false },
       { create: true }
     );
