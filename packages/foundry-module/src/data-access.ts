@@ -9017,7 +9017,19 @@ export class FoundryDataAccess {
         );
       }
 
-      // ── ATTACK PATH (T33-FIX): fast-forward the d20, auto-damage on hit ──
+      // ── ATTACK PATH (T33-FIX / T39 / T42): fast-forward the d20, auto-damage on hit ──
+      // T42: the d20 is rolled PER TARGET (was once, shared before the loop), so
+      // advantage can be granted to an incapacitated target only. Advantage on an
+      // attack vs an unconscious/paralyzed creature applies to ANY attack (ranged
+      // included) — unlike the T39 auto-crit, which is melee-and-within-5-ft only.
+      // dnd5e 5.3.3 expresses advantage as a top-level `{advantage:true}` on the
+      // rollAttack process config: `D20Roll.applyKeybindings` runs inside
+      // `buildConfigure` BEFORE the `configure:false` fast-forward branch and reads
+      // `config.advantage` (confirmed against the installed system source — the T42
+      // analogue of T39's `isCritical` gotcha, NOT assumed). Consequence: each
+      // target now posts its own attack card (was one shared card); the per-target
+      // roll detail lives in `results[]`, and the top-level summary fields reflect
+      // the first target (the common single-target case).
       if (attackActivity) {
         if (typeof attackActivity.rollAttack !== 'function') {
           throw new Error(
@@ -9025,20 +9037,6 @@ export class FoundryDataAccess {
           );
         }
 
-        // `{configure:false}` on the DIALOG config fast-forwards the attack-roll
-        // dialog; the resolved d20 posts to chat with no dialog.
-        const attackRolls = await attackActivity.rollAttack(
-          {},
-          { configure: false },
-          { create: true }
-        );
-        const attackRoll = Array.isArray(attackRolls) ? attackRolls[0] : attackRolls;
-        const attackTotal: number | null =
-          typeof attackRoll?.total === 'number' ? attackRoll.total : null;
-        // dnd5e D20Roll getters honour any adjusted crit range: a natural 20
-        // always hits + crits; a natural 1 always misses.
-        const isCrit = attackRoll?.isCritical === true;
-        const isFumble = attackRoll?.isFumble === true;
         // T39: only a MELEE attack can auto-crit vs an incapacitated adjacent
         // target. dnd5e stores the melee/ranged flag at attack.type.value.
         const attackIsMelee = (attackActivity as any).attack?.type?.value === 'melee';
@@ -9046,11 +9044,46 @@ export class FoundryDataAccess {
         const resolveToken = makeLiveTokenResolver();
         const targetIds = data.targetTokenIds ?? [];
         const results: any[] = [];
+        // Top-level summary — with per-target rolls there is no single shared roll;
+        // these mirror the FIRST target so the single-target common case reads
+        // exactly as before. Authoritative per-target values are in results[].
+        let summaryAttackTotal: number | null = null;
+        let summaryCrit = false;
+        let summaryFumble = false;
 
         for (const tid of targetIds) {
           const targetToken = scene.tokens.get(tid);
           const targetActor = (targetToken as any)?.actor;
           const ac = targetActor?.system?.attributes?.ac?.value ?? null;
+
+          // T42/T39: unconscious or paralyzed target. Drives BOTH advantage on the
+          // d20 (any attack) AND — for a melee attacker within 5 ft — the auto-crit.
+          const targetIncapacitated =
+            (targetActor as any)?.statuses?.has?.('unconscious') === true ||
+            (targetActor as any)?.statuses?.has?.('paralyzed') === true;
+
+          // T42: roll THIS target's own d20; advantage when the target is
+          // incapacitated. `{configure:false}` on the DIALOG config fast-forwards
+          // the attack-roll dialog; the resolved d20 posts to chat with no dialog.
+          const attackRolls = await attackActivity.rollAttack(
+            targetIncapacitated ? { advantage: true } : {},
+            { configure: false },
+            { create: true }
+          );
+          const attackRoll = Array.isArray(attackRolls) ? attackRolls[0] : attackRolls;
+          const attackTotal: number | null =
+            typeof attackRoll?.total === 'number' ? attackRoll.total : null;
+          // dnd5e D20Roll getters honour any adjusted crit range: a natural 20
+          // always hits + crits; a natural 1 always misses.
+          const isCrit = attackRoll?.isCritical === true;
+          const isFumble = attackRoll?.isFumble === true;
+
+          if (results.length === 0) {
+            summaryAttackTotal = attackTotal;
+            summaryCrit = isCrit;
+            summaryFumble = isFumble;
+          }
+
           const hit =
             isCrit || (!isFumble && attackTotal !== null && ac !== null && attackTotal >= ac);
 
@@ -9059,6 +9092,9 @@ export class FoundryDataAccess {
             tokenName: (targetToken as any)?.name ?? tid,
             ac,
             attackTotal,
+            // T42: whether this target's d20 was rolled with advantage (any attack
+            // vs an unconscious/paralyzed target).
+            advantage: targetIncapacitated,
           };
 
           if (!hit) {
@@ -9067,16 +9103,13 @@ export class FoundryDataAccess {
           }
 
           // T39: a MELEE hit from within 5 ft against an unconscious/paralyzed
-          // target is an automatic critical (RAW). The shared d20's natural-20
-          // crit (isCrit) still applies to every target; this ADDS the
-          // incapacitated-adjacent case, computed per target. Ranged attacks,
+          // target is an automatic critical (RAW), computed per target. The d20's
+          // own natural-20 crit (isCrit) still applies. Ranged attacks,
           // out-of-range attackers, and conscious targets are unchanged. The
           // `&&` chain short-circuits so distance is measured only for a melee
-          // hit on an incapacitated target. (Advantage on the attack d20 is
-          // deferred — the model rolls one shared d20 for all targets; see T39.)
-          const targetIncapacitated =
-            (targetActor as any)?.statuses?.has?.('unconscious') === true ||
-            (targetActor as any)?.statuses?.has?.('paralyzed') === true;
+          // hit on an incapacitated target. Stacks with T42 advantage: an adjacent
+          // melee attacker vs an incapacitated target rolls with advantage AND
+          // auto-crits on the resulting hit.
           const autoCrit =
             attackIsMelee &&
             targetIncapacitated &&
@@ -9174,13 +9207,15 @@ export class FoundryDataAccess {
           tokenName: token.name,
           itemName: item.name,
           activityType: 'attack',
-          attackTotal,
-          crit: isCrit,
-          fumble: isFumble,
+          attackTotal: summaryAttackTotal,
+          crit: summaryCrit,
+          fumble: summaryFumble,
           targets: targetIds,
           results,
           pcSaveRequested: null,
-          chatMessageCreated: attackTotal !== null,
+          // T42: each target posts its own attack card, so a card was created iff
+          // at least one target was rolled against.
+          chatMessageCreated: results.length > 0,
         };
       }
 
